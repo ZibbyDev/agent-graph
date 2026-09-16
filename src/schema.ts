@@ -1,5 +1,5 @@
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite';
-import type { EdgeRecord, NodeRecord, Provenance } from './types.js';
+import type { EdgeRecord, NodeRecord, Provenance, Row } from './types.js';
 
 export const SCHEMA_VERSION = 1;
 
@@ -7,14 +7,17 @@ export const SCHEMA_VERSION = 1;
  * Storage layout. Three ideas drive it:
  *
  *  - `node_versions` is the append-only truth for nodes; `nodes` is the latest
- *    version denormalised so that match/recall never scan history. Both are
- *    written in one transaction, so they cannot disagree.
+ *    version denormalised so that the live view (the default `asOf`) never
+ *    scans history. Both are written in one transaction, so they cannot
+ *    disagree. An `asOf` in the past reads `node_versions` instead — the
+ *    version current at that instant — which is why it carries the same
+ *    kind/label indexes as `nodes`.
  *  - `edges` is append-only too. Retiring an edge is an UPDATE of two
  *    bookkeeping columns (`superseded_at`, `superseded_by`), never a DELETE,
  *    which is what makes `asOf` queries possible.
  *  - `access` is deliberately a separate table keyed by edge id: it is written
- *    on every recall and must never make a read of `edges` slower or change
- *    what a read returns. It is recorded for a future, evaluated ranking
+ *    on every recall from a writable handle (never from a read-only one) and
+ *    must never make a read of `edges` slower or change what a read returns. It is recorded for a future, evaluated ranking
  *    version — nothing in v1 reads it.
  */
 const DDL = `
@@ -82,7 +85,77 @@ CREATE INDEX IF NOT EXISTS edges_rel         ON edges (rel);
 CREATE INDEX IF NOT EXISTS edges_recorded_at ON edges (recorded_at);
 CREATE INDEX IF NOT EXISTS nodes_kind        ON nodes (kind);
 CREATE INDEX IF NOT EXISTS nodes_label       ON nodes (label);
+CREATE INDEX IF NOT EXISTS node_versions_kind  ON node_versions (kind);
+CREATE INDEX IF NOT EXISTS node_versions_label ON node_versions (label);
 `;
+
+/**
+ * Column order of each table, as the INSERT statements below bind them and as
+ * `dump()` / `load()` move rows. One list per table; the DDL above is checked
+ * against these lists at open time so the two cannot drift.
+ */
+export const COLUMNS = {
+  nodes: ['id', 'kind', 'label', 'attrs', 'origin', 'provenance', 'version', 'recorded_at', 'created_by', 'created_at', 'flags'],
+  node_versions: ['id', 'version', 'kind', 'label', 'attrs', 'origin', 'provenance', 'recorded_at', 'flags'],
+  edges: ['id', 'src', 'dst', 'rel', 'cost', 'directed', 'scope', 'attrs', 'origin', 'provenance', 'valid_from', 'valid_to', 'recorded_at', 'superseded_at', 'supersedes', 'superseded_by', 'flags'],
+  access: ['edge_id', 'count', 'last_at'],
+} as const;
+
+export type TableName = keyof typeof COLUMNS;
+
+/** Primary key of each table, for the ordered `dump()` and the IGNORE on load. */
+export const PRIMARY_KEY: Record<TableName, readonly string[]> = {
+  nodes: ['id'],
+  node_versions: ['id', 'version'],
+  edges: ['id'],
+  access: ['edge_id'],
+};
+
+function insertInto(table: TableName, prefix = 'INSERT'): string {
+  const cols = COLUMNS[table];
+  return `${prefix} INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`;
+}
+
+/**
+ * Every statement that writes. The store prepares exactly these strings and
+ * `journalToSql()` renders exactly these strings, so "the SQL the store runs"
+ * has one definition.
+ */
+export const SQL = {
+  insertVersion: insertInto('node_versions'),
+  /** Live writes always carry a higher version, so the latest row wins
+   *  unconditionally. */
+  upsertNode:
+    `${insertInto('nodes')}
+     ON CONFLICT (id) DO UPDATE SET
+       kind = excluded.kind, label = excluded.label, attrs = excluded.attrs,
+       origin = excluded.origin, provenance = excluded.provenance, version = excluded.version,
+       recorded_at = excluded.recorded_at, flags = excluded.flags`,
+  insertEdge: insertInto('edges'),
+  retireEdge: `UPDATE edges SET superseded_at = ?, superseded_by = ? WHERE id = ? AND superseded_at IS NULL`,
+  bumpAccess:
+    `INSERT INTO access (edge_id, count, last_at) VALUES (?, 1, ?)
+     ON CONFLICT (edge_id) DO UPDATE SET count = count + 1, last_at = excluded.last_at`,
+  // Bulk load: append-only tables ignore a row whose key is already there;
+  // `nodes` keeps whichever version is higher, because two dumps may have
+  // been taken at different times and the newer one must not be undone.
+  loadVersion: insertInto('node_versions', 'INSERT OR IGNORE'),
+  loadEdge: insertInto('edges', 'INSERT OR IGNORE'),
+  loadAccess: insertInto('access', 'INSERT OR IGNORE'),
+  loadNode:
+    `${insertInto('nodes')}
+     ON CONFLICT (id) DO UPDATE SET
+       kind = excluded.kind, label = excluded.label, attrs = excluded.attrs,
+       origin = excluded.origin, provenance = excluded.provenance, version = excluded.version,
+       recorded_at = excluded.recorded_at, created_by = excluded.created_by, created_at = excluded.created_at, flags = excluded.flags
+     WHERE excluded.version > nodes.version`,
+} as const;
+
+/** The positional parameters for `table`, taken from a row by column name. A
+ *  missing column binds NULL and lets the NOT NULL constraint speak. */
+export function rowParams(table: TableName, row: Row): Array<string | number | null> {
+  return COLUMNS[table].map((c) => (row[c] === undefined ? null : row[c]));
+}
 
 export function isMemoryPath(path: string): boolean {
   return path === ':memory:' || path === '' || path.startsWith('file::memory:');
@@ -96,6 +169,16 @@ export function openDatabase(path: string): DatabaseSync {
   if (!isMemoryPath(path)) db.exec('PRAGMA journal_mode=WAL');
   db.exec('PRAGMA foreign_keys=ON');
   db.exec(DDL);
+  // Tripwire: the column lists are what every write binds and what dump/load
+  // move; a DDL edit that forgets them must fail here, not corrupt a row.
+  for (const table of Object.keys(COLUMNS) as TableName[]) {
+    const actual = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map((r) => r.name);
+    const expected = [...COLUMNS[table]];
+    if (actual.join(',') !== expected.join(',')) {
+      db.close();
+      throw new Error(`agent-graph: table ${table} has columns [${actual.join(', ')}] but this build binds [${expected.join(', ')}]`);
+    }
+  }
   const row = db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get() as
     | { value: string }
     | undefined;
@@ -116,7 +199,16 @@ export function openDatabase(path: string): DatabaseSync {
 // Row ↔ record mapping. Kept here, next to the DDL, so a column rename has one
 // place to be wrong.
 
-export type Row = Record<string, SQLOutputValue>;
+export type SqlRow = Record<string, SQLOutputValue>;
+
+/** A raw row as the public `Row` shape (bigint → number; blobs never occur). */
+export function toRow(r: SqlRow): Row {
+  const out: Row = {};
+  for (const [k, v] of Object.entries(r)) {
+    out[k] = v === null || v === undefined ? null : typeof v === 'bigint' ? Number(v) : typeof v === 'string' || typeof v === 'number' ? v : String(v);
+  }
+  return out;
+}
 
 function parseJson<T>(text: SQLOutputValue, fallback: T): T {
   if (typeof text !== 'string' || text === '') return fallback;
@@ -135,7 +227,7 @@ function numOrNull(v: SQLOutputValue): number | null {
   return v === null || v === undefined ? null : num(v);
 }
 
-export function rowToNode(r: Row): NodeRecord {
+export function rowToNode(r: SqlRow): NodeRecord {
   return {
     id: r.id as string,
     kind: r.kind as string,
@@ -153,11 +245,11 @@ export function rowToNode(r: Row): NodeRecord {
 
 /** A `node_versions` row lacks `created_by/created_at`; the caller supplies
  *  them from the latest row so every version carries the same lineage. */
-export function versionRowToNode(r: Row, createdBy: string, createdAt: number): NodeRecord {
+export function versionRowToNode(r: SqlRow, createdBy: string, createdAt: number): NodeRecord {
   return rowToNode({ ...r, created_by: createdBy, created_at: createdAt });
 }
 
-export function rowToEdge(r: Row): EdgeRecord {
+export function rowToEdge(r: SqlRow): EdgeRecord {
   return {
     id: r.id as string,
     src: r.src as string,

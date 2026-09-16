@@ -139,9 +139,11 @@ describe('fleet example', () => {
     assert.equal(many.raw.results.length, 3);
     assert.deepEqual(many.q1, await q1Graph(fx.graph, ADA));
     assert.deepEqual(many.q4, await q4Graph(fx.graph));
-    // Shared node map: every hit of every result is in it, once.
-    const ids = new Set(many.raw.results.flatMap((r) => r.hits.map((h) => h.node.id)));
+    // Shared node map: every hit of every result names a node in it, and the
+    // map holds each exactly once.
+    const ids = new Set(many.raw.results.flatMap((r) => r.hits.map((h) => h.nodeId)));
     assert.deepEqual(Object.keys(many.raw.nodes).sort(), [...ids].sort());
+    for (const r of many.raw.results) for (const h of r.hits) assert.ok(!('node' in h), 'a batch hit carries nodeId, not the record');
   });
 
   it('asOf: the round-2 view shows the superseded claim; the live view shows the correction', async () => {

@@ -45,9 +45,11 @@ function hub(g: Graph, c: ReturnType<typeof clock>) {
   return { t1a, t7a, t1b, t7b, t7p, dup };
 }
 
+/** The root is privileged (so tests can derive other-origin handles) and
+ *  hence trusted (the hub is 'observed'). */
 function fixture() {
   const c = clock();
-  const g = openGraph(':memory:', { origin: 'run:a', now: c.now });
+  const g = openGraph(':memory:', { origin: 'run:a', privileged: true, now: c.now });
   const edges = hub(g, c);
   return { g, c, edges };
 }
@@ -115,7 +117,7 @@ describe('recall — weighted walk', () => {
 
   test('undirected edges traverse either way at the same cost, in any direction mode', async () => {
     const c = clock();
-    const g = openGraph(':memory:', { origin: 'run:a', now: c.now });
+    const g = openGraph(':memory:', { origin: 'run:a', trusted: true, now: c.now });
     for (const id of ['a', 'b', 'c']) g.put({ id, kind: 'k', label: id, provenance: 'observed' });
     g.link({ src: 'a', dst: 'b', rel: 'peer', directed: false, cost: 1, provenance: 'observed' });
     g.link({ src: 'c', dst: 'b', rel: 'points', directed: true, cost: 1, provenance: 'observed' });
@@ -127,7 +129,7 @@ describe('recall — weighted walk', () => {
 
   test('ties: equal cost resolves to the earlier-recorded edge into the node', async () => {
     const c = clock();
-    const g = openGraph(':memory:', { origin: 'run:a', now: c.now });
+    const g = openGraph(':memory:', { origin: 'run:a', trusted: true, now: c.now });
     for (const id of ['s', 'x', 'y', 't']) g.put({ id, kind: 'k', label: id, provenance: 'observed' });
     // Two equal-cost routes s→x→t and s→y→t. The x branch is discovered
     // first (older first hop) but its final leg is the newer assertion, so
@@ -164,7 +166,7 @@ describe('recall — time axes', () => {
 
   test('validAt excludes an edge whose validTo has passed and one whose validFrom is ahead', async () => {
     const c = clock();
-    const g = openGraph(':memory:', { origin: 'run:a', now: c.now });
+    const g = openGraph(':memory:', { origin: 'run:a', trusted: true, now: c.now });
     for (const id of ['a', 'b', 'd']) g.put({ id, kind: 'k', label: id, provenance: 'observed' });
     g.link({ src: 'a', dst: 'b', rel: 'on_call', validFrom: 100, validTo: 200, provenance: 'observed' });
     g.link({ src: 'a', dst: 'd', rel: 'on_call', validFrom: 200, validTo: null, provenance: 'observed' });
@@ -174,9 +176,70 @@ describe('recall — time axes', () => {
     assert.deepEqual(ids(await g.recall({ seeds: ['a'], validAt: 50 })), []);
   });
 
+  test('asOf applies to nodes: the version current then, and nothing that did not exist yet', async () => {
+    const g = openGraph(':memory:', { origin: 'run:a', trusted: true, now: () => 1000 });
+    g.put({ id: 's', kind: 'k', label: 'seed', recordedAt: 100 });
+    g.put({ id: 'n', kind: 'k', label: 'old label', attrs: { v: 1 }, recordedAt: 100 });
+    g.link({ src: 's', dst: 'n', rel: 'r', recordedAt: 100 });
+    g.put({ id: 'n', kind: 'k', label: 'new label', attrs: { v: 2 }, recordedAt: 200 });
+    g.put({ id: 'late', kind: 'k', label: 'born at 300', recordedAt: 300 });
+    g.link({ src: 'late', dst: 'n', rel: 'r', recordedAt: 300 });
+
+    const live = await g.recall({ seeds: ['s'], maxCost: 1 });
+    assert.equal(live.hits[0].node.label, 'new label', 'default asOf = now → latest version');
+    assert.equal(live.hits[0].node.version, 2);
+
+    const then = await g.recall({ seeds: ['s'], maxCost: 1, asOf: 150 });
+    assert.equal(then.hits.length, 1);
+    assert.equal(then.hits[0].node.label, 'old label', 'the version current at 150');
+    assert.deepEqual(then.hits[0].node.attrs, { v: 1 });
+    assert.equal(then.hits[0].node.version, 1);
+    assert.equal(then.hits[0].node.recordedAt, 100);
+    assert.equal(then.hits[0].node.createdBy, 'run:a', 'lineage is carried onto historical versions');
+
+    // Matching is against the version current at asOf.
+    const byOld = await g.recall({ match: { label: 'old label' }, maxCost: 1, asOf: 150, includeSeeds: true });
+    assert.deepEqual(byOld.seeds, ['n']);
+    const byOldLater = await g.recall({ match: { label: 'old label' }, maxCost: 1, asOf: 250 });
+    assert.deepEqual(byOldLater.seeds, [], 'at 250 the label had changed');
+    const byNewEarly = await g.recall({ match: { label: 'new label' }, maxCost: 1, asOf: 150 });
+    assert.deepEqual(byNewEarly.seeds, [], 'at 150 the new label was not known');
+    const byKind = await g.recall({ match: { kind: 'k' }, maxCost: 0, asOf: 150, includeSeeds: true });
+    assert.deepEqual(byKind.seeds, ['n', 's'], "'late' does not exist at 150");
+
+    // A node first recorded after asOf does not exist: not a seed, not a hit.
+    const lateSeed = await g.recall({ seeds: ['late', 's'], maxCost: 1, asOf: 150, includeSeeds: true });
+    assert.deepEqual(lateSeed.seeds, ['s']);
+    assert.deepEqual(lateSeed.seedSources, [{ id: 's', via: 'seed' }]);
+    const reachLate = await g.recall({ seeds: ['n'], maxCost: 1, asOf: 350 });
+    assert.deepEqual(ids(reachLate), ['late', 's']);
+    const reachLateEarly = await g.recall({ seeds: ['n'], maxCost: 1, asOf: 250 });
+    assert.deepEqual(ids(reachLateEarly), ['s'], 'the edge from late is not known at 250 either');
+    // Subgraph reads the same versions.
+    const sg = await g.subgraph({ seeds: ['s'], maxCost: 1, asOf: 150 });
+    assert.deepEqual(sg.nodes.map((n) => [n.id, n.label]).sort(), [['n', 'old label'], ['s', 'seed']]);
+    // Graph.match stays the live view.
+    assert.deepEqual(g.match({ label: 'new label' }).map((n) => n.id), ['n']);
+    g.close();
+  });
+
+  test('validFrom omitted = unbounded past: an edge recorded at 200 holds at validAt 50', async () => {
+    const g = openGraph(':memory:', { origin: 'run:a', trusted: true, now: () => 200 });
+    g.put({ id: 'a', kind: 'k', label: 'a' });
+    g.put({ id: 'b', kind: 'k', label: 'b' });
+    g.put({ id: 'c', kind: 'k', label: 'c' });
+    const e = g.link({ src: 'a', dst: 'b', rel: 'r' });
+    assert.equal(e.recordedAt, 200);
+    assert.equal(e.validFrom, null, 'not defaulted to recordedAt');
+    g.link({ src: 'a', dst: 'c', rel: 'r', validFrom: 200 });
+    assert.deepEqual(ids(await g.recall({ seeds: ['a'], validAt: 50 })), ['b'], 'the unbounded fact held; the "starts now" one did not');
+    assert.deepEqual(ids(await g.recall({ seeds: ['a'], validAt: 200 })), ['b', 'c']);
+    g.close();
+  });
+
   test('recordedBetween window with null bounds', async () => {
     const c = clock();
-    const g = openGraph(':memory:', { origin: 'run:a', now: c.now });
+    const g = openGraph(':memory:', { origin: 'run:a', trusted: true, now: c.now });
     for (const id of ['a', 'b', 'd', 'e']) g.put({ id, kind: 'k', label: id, provenance: 'observed' });
     const t0 = c.t;
     g.link({ src: 'a', dst: 'b', rel: 'r', provenance: 'observed' });
@@ -196,7 +259,7 @@ describe('recall — time axes', () => {
 describe('recall — filters', () => {
   test('scope: null-scope edges are global, scoped edges need to be asked for', async () => {
     const c = clock();
-    const g = openGraph(':memory:', { origin: 'run:a', now: c.now });
+    const g = openGraph(':memory:', { origin: 'run:a', trusted: true, now: c.now });
     for (const id of ['a', 'g', 'm', 'f']) g.put({ id, kind: 'k', label: id, provenance: 'observed' });
     g.link({ src: 'a', dst: 'g', rel: 'r', provenance: 'observed' });
     g.link({ src: 'a', dst: 'm', rel: 'r', scope: 'main', provenance: 'observed' });
@@ -237,7 +300,7 @@ describe('recall — filters', () => {
 
   test('order recent / oldest by node recordedAt', async () => {
     const c = clock();
-    const g = openGraph(':memory:', { origin: 'run:a', now: c.now });
+    const g = openGraph(':memory:', { origin: 'run:a', trusted: true, now: c.now });
     g.put({ id: 's', kind: 'k', label: 's', provenance: 'observed' });
     for (const id of ['old', 'mid', 'new']) {
       c.tick();
@@ -271,7 +334,9 @@ describe('recall — filters', () => {
 });
 
 describe('recallMany', () => {
-  test('results stay grouped; nodes is one deduplicated map', async () => {
+  const nodeIds = (r: { hits: Array<{ nodeId: string }> }) => r.hits.map((h) => h.nodeId).sort();
+
+  test('results stay grouped; hits name nodes; nodes is one deduplicated map', async () => {
     const { g } = fixture();
     const r = await g.recallMany([
       { seeds: ['ticket:1'], maxCost: 1 },
@@ -279,11 +344,26 @@ describe('recallMany', () => {
       { match: { kind: 'nothing-like-this' } },
     ]);
     assert.equal(r.results.length, 3);
-    assert.deepEqual(ids(r.results[0]), ['file:a', 'file:b']);
-    assert.deepEqual(ids(r.results[1]), ['file:a', 'file:b', 'project:p', 'ticket:7']);
+    assert.deepEqual(nodeIds(r.results[0]), ['file:a', 'file:b']);
+    assert.deepEqual(nodeIds(r.results[1]), ['file:a', 'file:b', 'project:p', 'ticket:7']);
     assert.deepEqual(r.results[2].hits, []);
     assert.deepEqual(Object.keys(r.nodes).sort(), ['file:a', 'file:b', 'project:p', 'ticket:7']);
     assert.equal(r.nodes['ticket:7'].kind, 'ticket');
+    const hit = r.results[0].hits[0];
+    assert.deepEqual(Object.keys(hit).sort(), ['cost', 'nodeId', 'path', 'seed'], 'a batch hit is { nodeId, cost, path, seed }');
+    assert.deepEqual(r.results[1].seedSources, [{ id: 'ticket:7', via: 'seed' }], 'the rest of RecallResult is intact');
+  });
+
+  test('a node reached by two queries is serialised exactly once', async () => {
+    const { g } = fixture();
+    const r = await g.recallMany([
+      { seeds: ['ticket:1'], maxCost: 1 },
+      { seeds: ['ticket:7'], maxCost: 1 },
+    ]);
+    assert.ok(r.results.every((q) => q.hits.some((h) => h.nodeId === 'file:a')), 'both queries reach file:a');
+    const text = JSON.stringify(r);
+    const occurrences = text.split('"id":"file:a"').length - 1;
+    assert.equal(occurrences, 1, 'the node record appears once, in `nodes`');
   });
 });
 
@@ -304,6 +384,18 @@ describe('subgraph', () => {
     assert.equal(sg.edges.length, 6, 'every live edge among the five nodes; nothing touching repo:r');
     assert.ok(sg.edges.every((e) => e.src !== 'repo:r' && e.dst !== 'repo:r'));
     assert.equal(sg.truncated, false);
+  });
+
+  test('kinds filters the neighbourhood but never the seeds', async () => {
+    const { g } = fixture();
+    const sg = await g.subgraph({ seeds: ['ticket:1'], maxCost: 3, kinds: ['file'] });
+    assert.deepEqual(sg.seeds, ['ticket:1']);
+    assert.deepEqual(sg.nodes.map((n) => n.id).sort(), ['file:a', 'file:b', 'ticket:1'], 'the ticket seed stays although kinds says file');
+    assert.ok(sg.nodes.some((n) => n.id === 'ticket:1' && n.kind === 'ticket'));
+    assert.equal(sg.edges.length, 2, 'ticket:1 → file:a, ticket:1 → file:b');
+    // recall's contract is different: kinds does filter hits (seeds are out by default anyway).
+    const r = await g.recall({ seeds: ['ticket:1'], maxCost: 3, kinds: ['file'], includeSeeds: true });
+    assert.deepEqual(ids(r), ['file:a', 'file:b']);
   });
 
   test('honours the same filters as recall and does not bump access', async () => {
@@ -332,7 +424,7 @@ describe('access counts', () => {
     const path = join(dir, 'g.sqlite');
     try {
       const c = clock();
-      const g = openGraph(path, { origin: 'run:a', now: c.now });
+      const g = openGraph(path, { origin: 'run:a', trusted: true, now: c.now });
       const edges = hub(g, c);
       await g.subgraph({ seeds: ['ticket:1'], maxCost: 3 });
       await g.recall({ seeds: ['ticket:1'], maxCost: 2 });
@@ -350,6 +442,39 @@ describe('access counts', () => {
       assert.ok(g2.stats().bytes > 0, 'file-backed database reports its size');
       assert.equal(g2.stats().edges, 27);
       g2.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a read-only handle records nothing: recall leaves the access table empty', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'agent-graph-'));
+    const path = join(dir, 'g.sqlite');
+    try {
+      const c = clock();
+      const writer = openGraph(path, { origin: 'run:a', trusted: true, now: c.now });
+      hub(writer, c);
+      writer.close();
+
+      const ro = openGraph(path, { origin: 'reader', readOnly: true, now: c.now });
+      const r = await ro.recall({ seeds: ['ticket:1'], maxCost: 2 });
+      assert.ok(r.hits.length >= 3, 'the read itself works');
+      await ro.as('reader').recall({ seeds: ['ticket:7'], maxCost: 2 });
+      ro.close();
+
+      const db = new DatabaseSync(path);
+      const n = (db.prepare('SELECT COUNT(*) AS n FROM access').get() as { n: number }).n;
+      db.close();
+      assert.equal(Number(n), 0, 'a read must not write');
+
+      // The same recall from a writable handle does count.
+      const rw = openGraph(path, { origin: 'run:a', now: c.now });
+      await rw.recall({ seeds: ['ticket:1'], maxCost: 2 });
+      rw.close();
+      const db2 = new DatabaseSync(path);
+      const n2 = (db2.prepare('SELECT COUNT(*) AS n FROM access').get() as { n: number }).n;
+      db2.close();
+      assert.ok(Number(n2) > 0);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

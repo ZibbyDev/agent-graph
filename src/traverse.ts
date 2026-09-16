@@ -1,11 +1,12 @@
 import type { HandleContext, Store } from './graph.js';
-import { rowToEdge, rowToNode, type Row } from './schema.js';
+import { rowToEdge, rowToNode, SQL, type SqlRow } from './schema.js';
 import type {
   EdgeRecord,
   MatchQuery,
   NodeId,
   NodeRecord,
   RecallHit,
+  RecallManyHit,
   RecallManyResult,
   RecallQuery,
   RecallResult,
@@ -21,6 +22,12 @@ import type {
  * edges that are allowed to carry it — a filtered-out edge is never loaded,
  * never relaxed, never in a path. That is what makes a result explainable:
  * each hit's `path` is a proof of why it was returned, under the filters given.
+ *
+ * `asOf` applies to NODES as much as to edges: "what did the graph know at T"
+ * returns each node as the version current at T, and a node first recorded
+ * after T does not exist — not as a seed, not as a match, not as a hit. Every
+ * node read in a query therefore goes through `nodeAt(id, q.asOf)`; with no
+ * `asOf` that is the plain latest-version lookup.
  */
 
 const DEFAULT_MAX_COST = 2;
@@ -53,14 +60,14 @@ async function resolveSeeds(
   // merely suspects exist ("the file this ticket will touch"), and a batch of
   // questions should not fail because one guess was wrong. The audit trail
   // (`seedSources`) shows what actually resolved.
-  for (const id of q.seeds ?? []) if (ctx.store.node(id)) add(id, 'seed');
+  for (const id of q.seeds ?? []) if (ctx.store.nodeAt(id, q.asOf)) add(id, 'seed');
 
-  if (q.match) for (const n of matchNodes(ctx.store, q.match)) add(n.id, 'match');
+  if (q.match) for (const n of matchNodes(ctx.store, q.match, q.asOf)) add(n.id, 'match');
 
   if (q.locate !== undefined) {
     if (!ctx.locator) throw new Error('recall: `locate` given but no locator is configured on this graph');
     const ids = await ctx.locator.locate(q.locate, { limit: q.limit ?? DEFAULT_LIMIT });
-    for (const id of ids) if (ctx.store.node(id)) add(id, 'locate');
+    for (const id of ids) if (ctx.store.nodeAt(id, q.asOf)) add(id, 'locate');
   }
 
   return { seeds: seedSources.map((s) => s.id), seedSources };
@@ -69,27 +76,42 @@ async function resolveSeeds(
 /**
  * Exact node lookup — the ONE implementation behind `Graph.match` and the
  * `match` clause of a recall, so the two can never disagree about what
- * "matches" means.
+ * "matches" means. With `asOf` it matches against the version of each node
+ * current at that instant (read from `node_versions`); without, against the
+ * denormalised latest versions in `nodes`.
  */
-export function matchNodes(store: Store, q: MatchQuery): NodeRecord[] {
+export function matchNodes(store: Store, q: MatchQuery, asOf: number | undefined): NodeRecord[] {
   const where: string[] = [];
   const params: Array<string | number> = [];
-  if (q.kind !== undefined) { where.push('kind = ?'); params.push(q.kind); }
-  if (q.label !== undefined) { where.push('label = ?'); params.push(q.label); }
+  if (q.kind !== undefined) { where.push('v.kind = ?'); params.push(q.kind); }
+  if (q.label !== undefined) { where.push('v.label = ?'); params.push(q.label); }
   if (q.labelContains !== undefined) {
     // instr() rather than LIKE so `%` and `_` in the needle stay literal.
-    where.push('instr(lower(label), lower(?)) > 0');
+    where.push('instr(lower(v.label), lower(?)) > 0');
     params.push(q.labelContains);
   }
   const limit = q.limit ?? 100;
   const attrKeys = q.attrs ? Object.keys(q.attrs) : [];
-  let sql = `SELECT * FROM nodes${where.length ? ' WHERE ' + where.join(' AND ') : ''} ORDER BY id`;
+  let sql: string;
+  if (asOf === undefined) {
+    sql = `SELECT v.* FROM nodes v${where.length ? ' WHERE ' + where.join(' AND ') : ''} ORDER BY v.id`;
+  } else {
+    // The row for each node is its highest version recorded at or before
+    // asOf (same rule as Store.nodeAt); nodes with no such version did not
+    // exist yet and fall out of the join.
+    where.unshift(
+      'v.recorded_at <= ?',
+      'v.version = (SELECT MAX(w.version) FROM node_versions w WHERE w.id = v.id AND w.recorded_at <= ?)',
+    );
+    params.unshift(asOf, asOf);
+    sql = `SELECT v.*, n.created_by, n.created_at FROM node_versions v JOIN nodes n ON n.id = v.id WHERE ${where.join(' AND ')} ORDER BY v.id`;
+  }
   // Attr equality is decided in JS on canonical JSON (key order must not
   // matter), so the SQL LIMIT is only safe when no attr filter follows it.
   if (attrKeys.length === 0) { sql += ' LIMIT ?'; params.push(limit); }
   const out: NodeRecord[] = [];
   for (const r of store.db.prepare(sql).iterate(...params)) {
-    const node = rowToNode(r as Row);
+    const node = rowToNode(r as SqlRow);
     if (attrKeys.length && !attrKeys.every((k) => canonical(node.attrs[k]) === canonical(q.attrs![k]))) continue;
     out.push(node);
     if (out.length >= limit) break;
@@ -177,7 +199,7 @@ function buildExpander(ctx: HandleContext, q: RecallQuery): Expander {
   return {
     edgesFrom(node) {
       const bind = incidentArity === 2 ? [node, node] : [node, node, node];
-      return (perNode.all(...bind, ...params) as Row[]).map(rowToEdge);
+      return (perNode.all(...bind, ...params) as SqlRow[]).map(rowToEdge);
     },
     edgesWithin(ids) {
       if (ids.length === 0) return [];
@@ -190,7 +212,7 @@ function buildExpander(ctx: HandleContext, q: RecallQuery): Expander {
         const slice = ids.slice(i, i + CHUNK);
         const rows = ctx.store.db
           .prepare(`SELECT * FROM edges WHERE src IN (${placeholders(slice.length)}) AND ${common} ORDER BY recorded_at ASC, id ASC`)
-          .all(...slice, ...params) as Row[];
+          .all(...slice, ...params) as SqlRow[];
         for (const r of rows) if (inSet.has(r.dst as string)) out.push(rowToEdge(r));
       }
       return out;
@@ -321,8 +343,10 @@ export async function recall(ctx: HandleContext, q: RecallQuery): Promise<Recall
   let hits: RecallHit[] = [];
   for (const [id, s] of best) {
     if (seedSet.has(id) && !q.includeSeeds) continue;
-    const node = ctx.store.node(id);
-    if (!node) continue; // cannot happen: link() requires both endpoints
+    // Absent only when the node's first version postdates asOf (an edge can
+    // be back-filled earlier than its endpoint): it did not exist then.
+    const node = ctx.store.nodeAt(id, q.asOf);
+    if (!node) continue;
     if (kinds && !kinds.has(node.kind)) continue;
     hits.push({ node, cost: s.cost, path: pathTo(best, id), seed: s.seed });
   }
@@ -340,18 +364,29 @@ export async function recall(ctx: HandleContext, q: RecallQuery): Promise<Recall
   const truncated = hits.length > limit;
   if (truncated) hits = hits.slice(0, limit);
 
-  recordAccess(ctx, hits);
+  // A read must not write: a read-only handle leaves the access table alone.
+  if (!ctx.readOnly) recordAccess(ctx, hits);
 
   return { query: q, seeds, hits, truncated, seedSources };
 }
 
+/**
+ * N recalls, one shared node map. Hits carry `nodeId` only, so each node
+ * record is serialised exactly once however many queries reach it — the
+ * whole point of batching for a caller that pays per token.
+ */
 export async function recallMany(ctx: HandleContext, qs: RecallQuery[]): Promise<RecallManyResult> {
-  const results: RecallResult[] = [];
+  const results: RecallManyResult['results'] = [];
   const nodes: Record<NodeId, NodeRecord> = {};
   for (const q of qs) {
-    const r = await recall(ctx, q);
-    results.push(r);
-    for (const h of r.hits) nodes[h.node.id] = h.node;
+    const { hits, ...rest } = await recall(ctx, q);
+    const slim: RecallManyHit[] = hits.map((h) => {
+      // Two queries with different asOf may see different versions of one
+      // node; the later query wins the slot, as the map has one entry per id.
+      nodes[h.node.id] = h.node;
+      return { nodeId: h.node.id, cost: h.cost, path: h.path, seed: h.seed };
+    });
+    results.push({ ...rest, hits: slim });
   }
   return { results, nodes };
 }
@@ -368,12 +403,15 @@ export async function subgraph(ctx: HandleContext, q: RecallQuery): Promise<Subg
   const expander = buildExpander(ctx, q);
   const best = walk(expander, seeds, q.maxCost ?? DEFAULT_MAX_COST);
   const kinds = q.kinds ? new Set(q.kinds) : undefined;
+  const seedSet = new Set(seeds);
 
   let nodes: Array<{ node: NodeRecord; cost: number }> = [];
   for (const [id, s] of best) {
-    const node = ctx.store.node(id);
+    const node = ctx.store.nodeAt(id, q.asOf);
     if (!node) continue;
-    if (kinds && !kinds.has(node.kind)) continue;
+    // `kinds` shapes what is returned around the seeds; the seeds themselves
+    // are the centre of the picture and stay whatever their kind.
+    if (kinds && !kinds.has(node.kind) && !seedSet.has(id)) continue;
     nodes.push({ node, cost: s.cost });
   }
   const order = q.order ?? 'cost';
@@ -386,7 +424,6 @@ export async function subgraph(ctx: HandleContext, q: RecallQuery): Promise<Subg
   // The limit applies to the node set; seeds are exempt so the cut never
   // removes the centre of the picture.
   const limit = q.limit ?? DEFAULT_LIMIT;
-  const seedSet = new Set(seeds);
   const kept: NodeRecord[] = [];
   let reached = 0;
   let truncated = false;
@@ -410,7 +447,7 @@ function recordAccess(ctx: HandleContext, hits: RecallHit[]): void {
   for (const h of hits) for (const e of h.path) ids.push(e.id);
   if (ids.length === 0) return;
   ctx.store.transaction(() => {
-    for (const id of ids) ctx.store.bumpAccess.run(id, t);
+    for (const id of ids) ctx.store.run({ sql: SQL.bumpAccess, params: [id, t] });
   });
 }
 

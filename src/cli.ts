@@ -2,7 +2,7 @@
 /**
  * agent-graph — command-line surface.
  *
- *   agent-graph --db <path> [--origin <o>] [--privileged] [--read-only] <command> [json]
+ *   agent-graph --db <path> [--origin <o>] [--privileged] [--trusted] [--read-only] <command> [json]
  *
  * Commands are the tool definitions in `tools.ts` with the `graph_` prefix
  * dropped and underscores turned into hyphens (`graph_recall_many` →
@@ -38,20 +38,21 @@ export function usage(): string {
     `agent-graph ${packageVersion()} — a time-aware memory graph for agents`,
     '',
     'Usage:',
-    '  agent-graph --db <path> [--origin <o>] [--privileged] [--read-only] <command> [json]',
+    '  agent-graph --db <path> [--origin <o>] [--privileged] [--trusted] [--read-only] <command> [json]',
     '  agent-graph --help',
     '',
     'Options:',
     '  --db <path>      SQLite file (created on first write). ":memory:" for a throwaway graph.',
     '  --origin <o>     Origin stamped on every write from this invocation (a run id, an agent name).',
-    '  --privileged     Allow superseding other origins\' edges and re-labelling their nodes.',
+    '  --privileged     Allow superseding other origins\' edges and re-labelling their nodes (implies --trusted).',
+    '  --trusted        This process is a runtime that saw things happen: allow provenance "observed". Off = only "claimed".',
     '  --read-only      Refuse writes; only read commands are available.',
     '',
     'Commands (argument is one JSON object; read from stdin when omitted and stdin is not a terminal):',
     ...lines,
     '',
     'Examples:',
-    `  agent-graph --db memory.sqlite --origin run:7f3a put '{"id":"ticket:292","kind":"ticket","label":"Remove stale note","provenance":"observed"}'`,
+    `  agent-graph --db memory.sqlite --origin run:7f3a --trusted put '{"id":"ticket:292","kind":"ticket","label":"Remove stale note","provenance":"observed"}'`,
     `  agent-graph --db memory.sqlite recall '{"seeds":["ticket:292"],"maxCost":2,"rels":["worked_on","touched"]}'`,
     '  agent-graph --db memory.sqlite trace ticket:292',
     '  echo \'{"queries":[{"seeds":["ticket:292"]}]}\' | agent-graph --db memory.sqlite recall-many',

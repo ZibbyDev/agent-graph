@@ -110,7 +110,8 @@ describe('agent-graph MCP server', () => {
   });
 
   it('runs the protocol end to end and keeps stdout to JSON lines', async () => {
-    const c = new Client(['--db', db, '--origin', 'test-mcp']);
+    // This client is the runtime (it records 'observed' facts), so --trusted.
+    const c = new Client(['--db', db, '--origin', 'test-mcp', '--trusted']);
 
     // initialize echoes a supported protocol version…
     const init = await c.request('initialize', { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'test', version: '0' } });
@@ -196,6 +197,67 @@ describe('agent-graph MCP server', () => {
     }
 
     assert.equal(await c.close(), 0, 'exits cleanly when stdin ends');
+  });
+
+  it("an untrusted server refuses provenance 'observed' as a readable tool error", async () => {
+    const c = new Client(['--db', ':memory:', '--origin', 'agent']);
+    await c.request('initialize', { protocolVersion: '2025-06-18' });
+    const list = await c.request('tools/list');
+    const put = (list.result?.tools as Array<{ name: string; inputSchema: { properties: { provenance: { description: string } } } }>).find((t) => t.name === 'graph_put')!;
+    assert.match(put.inputSchema.properties.provenance.description, /--trusted/, 'the schema tells the model when observed is allowed');
+
+    const refused = await c.request('tools/call', { name: 'graph_put', arguments: { id: 'n:1', kind: 'n', label: 'x', provenance: 'observed' } });
+    assert.equal(refused.error, undefined);
+    assert.equal(refused.result?.isError, true);
+    assert.match(resultText(refused), /^PermissionError: .*reserved for runtimes/);
+    const ok = await c.request('tools/call', { name: 'graph_put', arguments: { id: 'n:1', kind: 'n', label: 'x' } });
+    assert.equal(ok.result?.isError, undefined);
+    assert.equal(JSON.parse(resultText(ok)).provenance, 'claimed');
+    await c.close();
+  });
+
+  it('validates arguments against the published schema before touching the graph', async () => {
+    const c = new Client(['--db', ':memory:', '--origin', 'agent', '--trusted']);
+    await c.request('initialize', { protocolVersion: '2025-06-18' });
+    await c.request('tools/call', { name: 'graph_put', arguments: { id: 'a', kind: 'k', label: 'A' } });
+    await c.request('tools/call', { name: 'graph_put', arguments: { id: 'b', kind: 'k', label: 'B' } });
+
+    const expectInvalid = async (name: string, args: unknown, field: RegExp) => {
+      const r = await c.request('tools/call', { name, arguments: args });
+      assert.equal(r.error, undefined, `${name}: a tool result, not a protocol error`);
+      assert.equal(r.result?.isError, true, `${name} ${JSON.stringify(args)} should be refused`);
+      assert.match(resultText(r), /^ValidationError: /);
+      assert.match(resultText(r), field);
+    };
+    await expectInvalid('graph_link', { src: 'a', dst: 'b', rel: 'r', recordedAt: 'yesterday' }, /recordedAt/);
+    await expectInvalid('graph_link', { src: 'a', dst: 'b', rel: 'r', recordedAt: 1.5 }, /recordedAt/);
+    await expectInvalid('graph_link', { src: 'a', dst: 'b', rel: 'r', provenance: 'invented' }, /provenance/);
+    await expectInvalid('graph_put', { id: 'c', kind: 'k', label: 'C', provenance: 'invented' }, /provenance/);
+    await expectInvalid('graph_link', { src: 'a', dst: 'b', rel: 'r', cost: 0 }, /cost/);
+    await expectInvalid('graph_link', { src: 'a', dst: 'b', rel: 'r', directed: 'yes' }, /directed/);
+    await expectInvalid('graph_link', { src: 'a', dst: 'b', rel: 'r', validFrom: '2024' }, /validFrom/);
+    await expectInvalid('graph_recall', { seeds: 'a' }, /seeds/);
+    await expectInvalid('graph_recall', { seeds: ['a'], asOf: 'now' }, /asOf/);
+    await expectInvalid('graph_recall', { seeds: ['a'], recordedBetween: [1] }, /recordedBetween/);
+    await expectInvalid('graph_recall', { seeds: ['a'], recordedBetween: [1, 'x'] }, /recordedBetween\[1\]/);
+    await expectInvalid('graph_recall', { seeds: ['a'], maxCost: 'lots' }, /maxCost/);
+    await expectInvalid('graph_recall', { seeds: ['a'], limit: 0 }, /limit/);
+    await expectInvalid('graph_recall', { seeds: ['a'], rels: 'touched' }, /rels/);
+    await expectInvalid('graph_recall', { seed: ['a'] }, /seed/);
+    await expectInvalid('graph_recall_many', { queries: [{ seeds: ['a'] }, { seeds: ['a'], validAt: null }] }, /queries\[1\]\.validAt/);
+    await expectInvalid('graph_supersede', { edgeId: 'e', replacement: { src: 'a', dst: 'b', rel: 'r', cost: -1 } }, /replacement\.cost/);
+    await expectInvalid('graph_get', { id: 'a', edgeId: 'e' }, /exactly one/);
+    await expectInvalid('graph_get', {}, /exactly one/);
+
+    // Nothing was written by any of the refused calls, and valid ones still work.
+    const stats = await c.request('tools/call', { name: 'graph_stats', arguments: {} });
+    assert.equal(JSON.parse(resultText(stats)).edges, 0);
+    const ok = await c.request('tools/call', { name: 'graph_link', arguments: { src: 'a', dst: 'b', rel: 'r', validFrom: null, recordedAt: 1000, cost: 2.5, directed: false } });
+    assert.equal(ok.result?.isError, undefined, resultText(ok));
+    const nullScope = await c.request('tools/call', { name: 'graph_recall', arguments: { seeds: ['a'], maxCost: 3, recordedBetween: [null, 2000], scope: ['main'] } });
+    assert.equal(nullScope.result?.isError, undefined, resultText(nullScope));
+    assert.equal(JSON.parse(resultText(nullScope)).hits.length, 1);
+    await c.close();
   });
 
   it('falls back to the latest protocol version for an unknown one', async () => {

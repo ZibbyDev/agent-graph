@@ -12,7 +12,7 @@
  */
 
 import type { DatabaseSync } from 'node:sqlite';
-import type { EdgeRecord, Graph, RecallHit, RecallManyResult, RecallQuery } from '../../src/types.js';
+import type { EdgeRecord, Graph, RecallHit, RecallManyHit, RecallManyResult, RecallQuery } from '../../src/types.js';
 import { all } from './baseline.js';
 import { D, HOUR, NOW, R1, R2, R3, T } from './fixture.js';
 
@@ -280,10 +280,16 @@ export function q4Sql(db: DatabaseSync, ticket = T, now = NOW): Q4 {
 // Q1 + Q4 in one call
 // ---------------------------------------------------------------------------
 
+/** A batch hit names its node; the record lives once in the shared map. Put
+ *  the two back together so the per-question code stays one implementation. */
+function hydrate(hits: RecallManyHit[], nodes: RecallManyResult['nodes']): RecallHit[] {
+  return hits.map(({ nodeId, ...rest }) => ({ node: nodes[nodeId], ...rest }));
+}
+
 export async function q1q4Many(g: Graph, member: string, ticket = T, now = NOW): Promise<{ q1: Q1; q4: Q4; raw: RecallManyResult }> {
   const raw = await g.recallMany([qTouchedBy(member), qPlannedFor(ticket), qEditingNow(ticket, now)]);
-  const [touched, planned, editing] = raw.results;
-  return { q1: q1FromHits(member, touched.hits, planned.hits), q4: q4FromHits(ticket, planned.hits, editing.hits), raw };
+  const [touched, planned, editing] = raw.results.map((r) => hydrate(r.hits, raw.nodes));
+  return { q1: q1FromHits(member, touched, planned), q4: q4FromHits(ticket, planned, editing), raw };
 }
 
 // ---------------------------------------------------------------------------

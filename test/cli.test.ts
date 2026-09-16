@@ -54,7 +54,8 @@ function meaningfulStderr(text: string): string {
 describe('agent-graph CLI', () => {
   let dir: string;
   let db: string;
-  const base = () => ['--db', db, '--origin', 'test-cli'];
+  // The suite's writer is a runtime (it records 'observed' facts), so it is --trusted.
+  const base = () => ['--db', db, '--origin', 'test-cli', '--trusted'];
 
   before(() => {
     dir = mkdtempSync(join(tmpdir(), 'agent-graph-cli-'));
@@ -187,6 +188,31 @@ describe('agent-graph CLI', () => {
     const s = await runCli(['--db', db, '--read-only', 'stats']);
     assert.equal(s.code, 0, s.stderr);
     assert.equal(parse<{ nodes: number }>(s.stdout).nodes, 2);
+  });
+
+  it("without --trusted, provenance 'observed' is a PermissionError; 'claimed' goes through", async () => {
+    const w = await runCli(['--db', db, '--origin', 'agent', 'put', JSON.stringify({ id: 'note:1', kind: 'note', label: 'n', provenance: 'observed' })]);
+    assert.equal(w.code, 1);
+    assert.equal(w.stdout, '');
+    const err = parse<{ error: { name: string; message: string } }>(meaningfulStderr(w.stderr));
+    assert.equal(err.error.name, 'PermissionError');
+    assert.match(err.error.message, /--trusted/);
+    const ok = await runCli(['--db', db, '--origin', 'agent', 'put', JSON.stringify({ id: 'note:1', kind: 'note', label: 'n' })]);
+    assert.equal(ok.code, 0, ok.stderr);
+    assert.equal(parse(ok.stdout).provenance, 'claimed');
+  });
+
+  it('arguments are validated against the tool schema: a ValidationError names the field', async () => {
+    const r = await runCli([...base(), 'link', JSON.stringify({ src: 'run:1', dst: 'ticket:1', rel: 'r', recordedAt: 'yesterday' })]);
+    assert.equal(r.code, 1);
+    assert.equal(r.stdout, '');
+    const err = parse<{ error: { name: string; message: string } }>(meaningfulStderr(r.stderr));
+    assert.equal(err.error.name, 'ValidationError');
+    assert.match(err.error.message, /recordedAt/);
+    assert.ok(!err.error.message.includes('yesterday'), 'the value is not echoed');
+    const typo = await runCli([...base(), 'recall', JSON.stringify({ seed: ['ticket:1'] })]);
+    assert.equal(parse<{ error: { name: string; message: string } }>(meaningfulStderr(typo.stderr)).error.name, 'ValidationError');
+    assert.match(meaningfulStderr(typo.stderr), /seed/);
   });
 
   it('subgraph returns the induced nodes and edges', async () => {

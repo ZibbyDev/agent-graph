@@ -2,7 +2,7 @@
 /**
  * agent-graph-mcp — a Model Context Protocol server over stdio.
  *
- *   agent-graph-mcp --db <path> [--origin <o>] [--privileged] [--read-only]
+ *   agent-graph-mcp --db <path> [--origin <o>] [--privileged] [--trusted] [--read-only]
  *
  * Hand-rolled, no SDK: the protocol surface this server needs is small
  * (initialize, ping, tools/list, tools/call, and empty resources/prompts
@@ -159,8 +159,9 @@ export class McpServer {
 
   /** Tool errors are RESULTS with `isError: true`, not protocol errors: the
    *  model is meant to read them and recover (a GuardError says what to
-   *  strip, a PermissionError which origin owns the edge). Only an unknown
-   *  tool or malformed arguments are protocol errors. */
+   *  strip, a PermissionError which origin owns the edge, a ValidationError
+   *  which field does not fit its schema). Only an unknown tool or a
+   *  non-object `arguments` are protocol errors. */
   private async callTool(p: Record<string, unknown>): Promise<unknown> {
     const name = p.name;
     if (typeof name !== 'string') throw new RpcError(INVALID_PARAMS, '"name" must be a string');
@@ -247,12 +248,13 @@ export function usage(): string {
     `agent-graph-mcp ${packageVersion()} — Model Context Protocol server (stdio) for agent-graph`,
     '',
     'Usage:',
-    '  agent-graph-mcp --db <path> [--origin <o>] [--privileged] [--read-only]',
+    '  agent-graph-mcp --db <path> [--origin <o>] [--privileged] [--trusted] [--read-only]',
     '',
     'Options:',
     '  --db <path>      SQLite file (created on first write). ":memory:" for a throwaway graph.',
     '  --origin <o>     Origin stamped on every write made through this server (e.g. "claude", "codex").',
-    '  --privileged     Allow superseding other origins\' edges and re-labelling their nodes.',
+    '  --privileged     Allow superseding other origins\' edges and re-labelling their nodes (implies --trusted).',
+    '  --trusted        The server acts for a runtime that saw things happen: allow provenance "observed". Off = only "claimed".',
     '  --read-only      Expose only the read tools.',
     '',
     'Speaks newline-delimited JSON-RPC 2.0 on stdin/stdout; diagnostics go to stderr.',
@@ -290,7 +292,7 @@ export function main(argv: string[]): void {
   process.on('SIGTERM', () => shutdown(0));
 
   serveStdio(server, () => shutdown(0));
-  log(`serving ${args.db}${args.readOnly ? ' (read-only)' : ''}${args.origin ? ` as ${args.origin}` : ''}`);
+  log(`serving ${args.db}${args.readOnly ? ' (read-only)' : ''}${args.trusted || args.privileged ? ' (trusted)' : ''}${args.origin ? ` as ${args.origin}` : ''}`);
 }
 
 function invokedAsBinary(): boolean {

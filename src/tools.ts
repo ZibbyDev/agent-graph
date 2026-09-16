@@ -8,16 +8,22 @@
  * derives `tools/list` from it. Neither carries its own copy of the schema, so
  * the two surfaces cannot drift.
  *
+ * The schema is also what VALIDATES the arguments: every `run` below is
+ * wrapped so the arguments are checked against `inputSchema` first
+ * (validate.ts), and a violation is a `ValidationError` naming the field.
+ * There is no second list of what a field must be.
+ *
  * The `origin` of every write is the handle's origin (`--origin` on both
  * binaries); it is deliberately not an argument, because the point of the
- * origin is that the writer does not choose it per call.
+ * origin is that the writer does not choose it per call. Likewise
+ * `provenance: 'observed'` is only accepted when the binary was started with
+ * `--trusted` — the tool descriptions say so, so a model does not try.
  */
 
-import type { Graph, Provenance } from './types.js';
+import type { Graph, JsonSchema, Provenance } from './types.js';
+import { validateArgs } from './validate.js';
 
-/** A JSON Schema fragment. Kept loose on purpose: the schemas below are
- *  data, not code, and are consumed by MCP clients as plain objects. */
-export type JsonSchema = Record<string, unknown>;
+export type { JsonSchema } from './types.js';
 
 export interface ToolDefinition {
   name: string;
@@ -37,8 +43,11 @@ const PROVENANCE: JsonSchema = {
   enum: ['observed', 'claimed'] satisfies Provenance[],
   description:
     "Who vouches for this. 'observed' = a runtime or tool saw it happen (a file was written, a ticket moved). " +
-    "'claimed' = an agent concluded or judged it (a diagnosis, a note, an opinion). Readers use this to decide how much to trust the record.",
+    "'claimed' = an agent concluded or judged it (a diagnosis, a note, an opinion). Readers use this to decide how much to trust the record. " +
+    "Default 'claimed'. 'observed' is accepted only when the server was started with --trusted; otherwise it is refused, so as an agent write 'claimed' (or omit).",
 };
+
+const PROVENANCE_OPTIONAL: JsonSchema = { ...PROVENANCE, description: `${PROVENANCE.description as string} Optional.` };
 
 const ATTRS: JsonSchema = {
   type: 'object',
@@ -47,7 +56,7 @@ const ATTRS: JsonSchema = {
     'Free-form JSON attributes. Values that look like credentials (API keys, tokens, Bearer headers, private keys) are REJECTED and the write throws; never put secrets here.',
 };
 
-const MS_EPOCH = 'Milliseconds since the Unix epoch (Date.now()).';
+const MS_EPOCH = 'Integer milliseconds since the Unix epoch (Date.now()).';
 
 const NODE_ID: JsonSchema = {
   type: 'string',
@@ -89,17 +98,19 @@ const EDGE_INPUT_PROPERTIES: Record<string, JsonSchema> = {
       'Branch / version / environment the assertion applies to (e.g. a git branch). Null or omitted = global, visible to every scoped query.',
   },
   attrs: { ...ATTRS, description: `${ATTRS.description as string} Typical: { reason }, { text }, { status }.` },
-  provenance: { ...PROVENANCE, description: `${PROVENANCE.description as string} Optional; the graph default applies when omitted.` },
+  provenance: PROVENANCE_OPTIONAL,
   validFrom: {
-    type: ['number', 'null'],
-    description: `World time at which the fact started to hold. ${MS_EPOCH} Null = unbounded (has always held). Omit for "from now".`,
+    type: ['integer', 'null'],
+    description:
+      `World time at which the fact started to hold. ${MS_EPOCH} Null OR OMITTED = unbounded past: a fact asserted now may have held before anyone recorded it, ` +
+      'so a validAt query at any earlier instant still finds this edge. For "starts now" pass validFrom: Date.now() explicitly.',
   },
   validTo: {
-    type: ['number', 'null'],
+    type: ['integer', 'null'],
     description: `World time at which the fact stopped holding. ${MS_EPOCH} Null/omitted = still holds (an OPEN fact, e.g. a run that is still editing a file).`,
   },
   recordedAt: {
-    type: 'number',
+    type: 'integer',
     description: `Knowledge time: when the graph learned this. ${MS_EPOCH} Defaults to now. Set it only when back-filling history.`,
   },
 };
@@ -179,20 +190,21 @@ const RECALL_QUERY_PROPERTIES: Record<string, JsonSchema> = {
   },
   includeSeeds: { type: 'boolean', default: false, description: 'Include the seed nodes themselves as hits (cost 0, empty path). Default false.' },
   validAt: {
-    type: 'number',
+    type: 'integer',
     description:
       `WORLD-time filter. ${MS_EPOCH} Only traverse edges whose [validFrom, validTo] contains this instant — "what was true then". ` +
       'Use Date.now() to see only facts that still hold (e.g. files being edited RIGHT NOW: open edges with validTo null). Omit to ignore world time.',
   },
   asOf: {
-    type: 'number',
+    type: 'integer',
     description:
-      `KNOWLEDGE-time filter. ${MS_EPOCH} What the graph KNEW at this instant: only edges recorded at or before it and not yet superseded at it. ` +
-      'Defaults to now (the live view: superseded assertions are hidden). Set it in the past to reconstruct an earlier state of knowledge, e.g. to see a claim before it was corrected.',
+      `KNOWLEDGE-time filter. ${MS_EPOCH} What the graph KNEW at this instant: only edges recorded at or before it and not yet superseded at it, ` +
+      'and each node as the VERSION current then (a node first recorded later does not exist yet: it cannot seed, match or be returned). ' +
+      'Defaults to now (the live view: latest versions, superseded assertions hidden). Set it in the past to reconstruct an earlier state of knowledge, e.g. to see a claim before it was corrected.',
   },
   recordedBetween: {
     type: 'array',
-    items: { type: ['number', 'null'] },
+    items: { type: ['integer', 'null'] },
     minItems: 2,
     maxItems: 2,
     description:
@@ -235,14 +247,14 @@ function requireObject(args: Record<string, unknown>, key: string): Record<strin
 // The tools
 // ---------------------------------------------------------------------------
 
-export const tools: ToolDefinition[] = [
+const definitions: ToolDefinition[] = [
   {
     name: 'graph_put',
     readOnly: false,
     description:
       'Create or update a node (an entity: a file, ticket, run, person, repo, conclusion). Upsert by id: a new id creates version 1; an existing id appends a version, so history is kept. ' +
-      'Call it before linking so both ends of an edge exist. Another origin may only merge attrs into your node (kind and label must match) unless privileged. ' +
-      'Credential-shaped values in label/attrs are rejected; instruction-shaped labels are accepted but flagged.',
+      "Call it before linking so both ends of an edge exist. On a node another origin created you may only ADD attrs whose keys are not there yet (kind and label must match; an existing key with a different value is refused) — " +
+      'use a new key or a note edge instead of overwriting. Credential-shaped values anywhere (id, kind, label, attrs) are rejected; instruction-shaped labels are accepted but flagged.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -250,8 +262,8 @@ export const tools: ToolDefinition[] = [
         kind: { type: 'string', description: "Free-string kind: 'file', 'ticket', 'run', 'member', 'repo', 'epic', 'note', …" },
         label: { type: 'string', description: 'Human-readable name (a path, a ticket title, a run name). Used by graph_match labelContains.' },
         attrs: ATTRS,
-        provenance: { ...PROVENANCE, description: `${PROVENANCE.description as string} Optional; the graph default applies when omitted.` },
-        recordedAt: { type: 'number', description: `Knowledge time of this version. ${MS_EPOCH} Defaults to now.` },
+        provenance: PROVENANCE_OPTIONAL,
+        recordedAt: { type: 'integer', description: `Knowledge time of this version. ${MS_EPOCH} Defaults to now.` },
       },
       required: ['id', 'kind', 'label'],
       additionalProperties: false,
@@ -265,8 +277,8 @@ export const tools: ToolDefinition[] = [
     readOnly: false,
     description:
       'Assert a relation between two nodes (src →rel→ dst). Every call appends a NEW edge with its own id — it never merges with an existing one, so the same relation can be asserted by several runs, ' +
-      'retired, and re-asserted. Set cost to shape later recall (cheap = close), validFrom/validTo for when the fact held in the world (leave validTo unset for a fact that still holds), ' +
-      'scope for branch/environment, and provenance to say whether this was observed or is your own claim.',
+      'retired, and re-asserted. Set cost to shape later recall (cheap = close), validFrom/validTo for when the fact held in the world (omitted validFrom = has always held; omitted validTo = still holds), ' +
+      "scope for branch/environment, and provenance ('claimed' unless the server was started with --trusted).",
     inputSchema: {
       ...EDGE_INPUT,
       description: 'The assertion to record. src and dst should already exist.',
@@ -348,8 +360,8 @@ export const tools: ToolDefinition[] = [
     name: 'graph_recall_many',
     readOnly: true,
     description:
-      'Several graph_recall queries in one call and one database load. Results stay grouped per query (same order as `queries`); `nodes` is the shared, deduplicated node map, so a node reached by several queries is serialised once. ' +
-      'Prefer this when a task needs more than one view (e.g. "what did X touch" and "who is editing T\'s files now" together).',
+      'Several graph_recall queries in one call and one database load. Results stay grouped per query (same order as `queries`); each hit carries `nodeId`, `cost`, `path`, `seed` — the node record itself is in ' +
+      'the shared `nodes` map, exactly once however many queries reach it. Prefer this when a task needs more than one view (e.g. "what did X touch" and "who is editing T\'s files now" together).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -369,7 +381,7 @@ export const tools: ToolDefinition[] = [
     readOnly: true,
     description:
       'Export the induced subgraph around a query: every node a graph_recall with the same arguments would reach, plus ALL live edges among those nodes (not just the cheapest paths). ' +
-      'This is the input for visualisation — "pick an area to view" — and for hand-offs that need the full local structure. Same filters as graph_recall (rels, kinds, scope, provenance, direction, maxCost). ' +
+      'This is the input for visualisation — "pick an area to view" — and for hand-offs that need the full local structure. Same filters as graph_recall (rels, kinds, scope, provenance, direction, maxCost); the seeds are always in `nodes`, whatever `kinds` says. ' +
       TIME_AXES_NOTE +
       ' Slice with recordedBetween to render how an area grew round by round. Ids, kinds and rels are stable, so a renderer can key colour and shape on them.',
     inputSchema: { ...RECALL_QUERY, description: 'A recall query; the result is the subgraph induced by what it reaches.' },
@@ -418,6 +430,21 @@ export const tools: ToolDefinition[] = [
     },
   },
 ];
+
+/**
+ * The tools as the two surfaces see them: `run` validates the arguments
+ * against the tool's own `inputSchema` before touching the graph, so a
+ * malformed call (`recordedAt: "yesterday"`, `provenance: "invented"`, a
+ * misspelt field) is refused by name at the boundary rather than half-applied
+ * or silently ignored.
+ */
+export const tools: ToolDefinition[] = definitions.map((t) => ({
+  ...t,
+  run(graph, args) {
+    validateArgs(t.name, t.inputSchema, args);
+    return t.run(graph, args);
+  },
+}));
 
 /** Lookup by tool name; undefined when unknown. */
 export function findTool(name: string): ToolDefinition | undefined {

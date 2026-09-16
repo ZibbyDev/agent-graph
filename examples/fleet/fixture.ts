@@ -348,17 +348,22 @@ export interface Fixture {
  * Apply the facts to a fresh graph, moving the clock to each fact's instant
  * so recordedAt (knowledge time) follows the story. Every write goes through
  * a handle opened as the fact's origin, exactly as the real runtime would.
+ *
+ * The root handle is the RUNTIME: privileged (it derives a handle per origin)
+ * and therefore trusted (the facts are things it observed). Each member's
+ * handle is derived trusted but not privileged — which is exactly why Bo's
+ * attempt to retire Ada's claim is refused below.
  */
 export function buildGraph(path = ':memory:'): Fixture {
   const facts = fleetFacts();
   const clock = new Clock(R1);
-  const root = openGraph(path, { origin: MANAGER, now: clock.now });
+  const root = openGraph(path, { origin: MANAGER, privileged: true, now: clock.now });
   const handles = new Map<string, Graph>();
   const as = (origin: string, privileged = false): Graph => {
     const k = `${origin}|${privileged}`;
     let h = handles.get(k);
     if (!h) {
-      h = root.as(origin, { privileged });
+      h = root.as(origin, { privileged, trusted: true });
       handles.set(k, h);
     }
     return h;

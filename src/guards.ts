@@ -1,10 +1,13 @@
 import { GuardError, type GuardReport } from './types.js';
 
 /**
- * Content guards run on every write, over the label (or rel) and the JSON of
- * the attrs. They exist because a memory graph is read back into a model's
- * context: a credential stored here leaks to every future reader, and a label
- * phrased as an instruction can steer a reader that trusts its own memory.
+ * Content guards run on every write, over EVERY string that will be
+ * persisted: id, kind, label, origin and the attrs JSON of a node; id, src,
+ * dst, rel, scope, origin and the attrs JSON of an edge. They exist because a
+ * memory graph is read back into a model's context: a credential stored here
+ * leaks to every future reader, and a label phrased as an instruction can
+ * steer a reader that trusts its own memory. An id or a scope is as much a
+ * string a model will read as a label is, so none of them is exempt.
  *
  * Two different responses on purpose. Credentials are REJECTED — there is no
  * legitimate reason for one to be in a memory graph, and redacting silently
@@ -12,6 +15,10 @@ import { GuardError, type GuardReport } from './types.js';
  * FLAGGED, because a ticket title may legitimately read "you must rotate the
  * key" and dropping it would lose real information; the flag lets a reader
  * decide how much to trust it.
+ *
+ * A rejection names the FIELD and the pattern CLASS, never the text: the
+ * error travels to logs, to stderr, into an MCP result a model reads — every
+ * place the secret must not go.
  */
 
 /** Each pattern is anchored to a well-known credential shape, not to the
@@ -37,7 +44,8 @@ export const INSTRUCTION_FLAG = 'instruction-shaped';
 export const CREDENTIAL_FLAG = 'credential';
 
 /** Pure check over a piece of text. Exported so the CLI/MCP layers can
- *  pre-flight content without touching the database. */
+ *  pre-flight content without touching the database. The report never
+ *  contains the text. */
 export function checkContent(text: string): GuardReport {
   for (const { name, re } of CREDENTIAL_PATTERNS) {
     if (re.test(text)) {
@@ -49,15 +57,42 @@ export function checkContent(text: string): GuardReport {
   return { rejected: false, flags };
 }
 
+/** The strings of one write, by field name. `undefined`/`null` fields are
+ *  absent; objects (attrs) are scanned as the JSON that will be stored. */
+export type GuardFields = Record<string, string | number | boolean | Record<string, unknown> | null | undefined>;
+
 /**
- * Guard a write. Returns the flags to store on the record, or throws
- * `GuardError` before anything is written. `what` names the record for the
- * error message ("node ticket:1", "edge run→file").
+ * Guard a write. Returns the flags to store on the record (the union over
+ * every field), or throws `GuardError` naming the offending FIELD before
+ * anything is written. `op` is the operation for the message ("put", "link").
  */
-export function guardWrite(what: string, text: string, attrs: Record<string, unknown>): string[] {
-  const report = checkContent(`${text}\n${JSON.stringify(attrs)}`);
-  if (report.rejected) {
-    throw new GuardError(`${what} rejected: ${report.reason}`, report);
+export function guardFields(op: string, fields: GuardFields): string[] {
+  const flags = new Set<string>();
+  for (const [field, value] of Object.entries(fields)) {
+    if (value === undefined || value === null) continue;
+    const report = checkContent(fieldText(value));
+    if (report.rejected) {
+      // "(github token)" tells the writer what to strip; the value itself is
+      // exactly what must not appear here.
+      const cls = report.reason?.replace(/^credential-shaped value /, '') ?? '';
+      throw new GuardError(`${op}: ${field} looks like a credential ${cls}`.trimEnd(), { ...report, field });
+    }
+    for (const f of report.flags) flags.add(f);
   }
-  return report.flags;
+  return [...flags];
+}
+
+/** The flags `guardFields` would store, for content that has ALREADY passed
+ *  the guards (a journaled op). Same scan, same union, no rejection. */
+export function collectFlags(fields: GuardFields): string[] {
+  const flags = new Set<string>();
+  for (const value of Object.values(fields)) {
+    if (value === undefined || value === null) continue;
+    for (const f of checkContent(fieldText(value)).flags) flags.add(f);
+  }
+  return [...flags];
+}
+
+function fieldText(value: NonNullable<GuardFields[string]>): string {
+  return typeof value === 'object' ? JSON.stringify(value) : String(value);
 }

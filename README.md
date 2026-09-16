@@ -12,7 +12,7 @@ Most agent-memory systems answer this with a flat list of "facts" ranked by rece
 
 - **Untyped nodes and edges.** A ticket, a run, a file, a person, a conclusion — each is a node with a free-string `kind`. Any node can link to any node with a free-string `rel`. No fixed hierarchy, no fixed depth.
 - **Edges are assertions, not facts.** Each edge has its own id, an `origin` (who asserted it), a `provenance` (`observed` by a runtime vs `claimed` by an agent), an optional `scope` (branch, version, environment), and two time axes. The same relation can be asserted twice, retired, and re-asserted. Nothing is ever deleted — `supersede()` stamps the old edge and records the replacement.
-- **Two time axes, both yours to pick.** `validAt` asks "what was true at this instant"; `asOf` asks "what did the graph *know* at this instant". They are independent parameters, not something inferred from prose.
+- **Two time axes, both yours to pick.** `validAt` asks "what was true at this instant"; `asOf` asks "what did the graph *know* at this instant" — for edges and for nodes (you get each node as the version current then, and a node first recorded later does not exist yet). They are independent parameters, not something inferred from prose.
 - **Retrieval by weighted distance.** Give it entry points and a cost budget; it walks the graph and returns every node within reach, with the exact path it took. Edge costs are yours: "touched the same file" might cost 1, "same repository" might cost 10, so a hub node can't drag the whole project in.
 - **Batch queries.** One call, many questions, one database load.
 
@@ -29,7 +29,9 @@ Requires Node ≥ 22.13 (uses the built-in `node:sqlite`).
 ```js
 import { openGraph } from 'agent-graph';
 
-const g = openGraph('./memory.sqlite', { origin: 'run:7f3a' });
+// `trusted` because this code IS the runtime: it may record what it observed.
+// A handle without it (an agent's MCP session) can only write `claimed`.
+const g = openGraph('./memory.sqlite', { origin: 'run:7f3a', trusted: true });
 
 // Every endpoint must exist before it can be linked — ids are yours to mint.
 g.put({ id: 'run:7f3a', kind: 'run', label: 'developer on ticket 292', provenance: 'observed' });
@@ -49,21 +51,22 @@ g.link({
 const r = await g.recall({ seeds: ['ticket:292'], maxCost: 2, rels: ['worked_on', 'touched'] });
 for (const hit of r.hits) console.log(hit.node.id, hit.cost, hit.path.map(e => e.rel));
 
-// What did we know a week ago?
+// What did we know a week ago? (edges as then known, nodes as then described)
 await g.recall({ seeds: ['file:repo/src/marketplace.js'], asOf: Date.now() - 7 * 864e5 });
 
-// Several questions, one load:
-await g.recallMany([
+// Several questions, one load. Hits carry `nodeId`; the record is in `nodes`, once.
+const many = await g.recallMany([
   { seeds: ['ticket:292'], maxCost: 2 },
   { match: { kind: 'file', labelContains: 'marketplace' }, maxCost: 1, order: 'recent' },
 ]);
+for (const hit of many.results[0].hits) console.log(many.nodes[hit.nodeId].label, hit.cost);
 ```
 
 ## Command line
 
 ```sh
-agent-graph --db memory.sqlite --origin run:7f3a put  '{"id":"ticket:292","kind":"ticket","label":"…","provenance":"observed"}'
-agent-graph --db memory.sqlite --origin run:7f3a link '{"src":"run:7f3a","dst":"ticket:292","rel":"worked_on","provenance":"observed"}'
+agent-graph --db memory.sqlite --origin run:7f3a --trusted put  '{"id":"ticket:292","kind":"ticket","label":"…","provenance":"observed"}'
+agent-graph --db memory.sqlite --origin run:7f3a --trusted link '{"src":"run:7f3a","dst":"ticket:292","rel":"worked_on","provenance":"observed"}'
 agent-graph --db memory.sqlite recall   '{"seeds":["ticket:292"],"maxCost":2}'
 agent-graph --db memory.sqlite trace    ticket:292
 agent-graph --db memory.sqlite subgraph '{"seeds":["ticket:292"],"maxCost":2}'
@@ -72,14 +75,16 @@ echo '{"queries":[{"seeds":["ticket:292"]},{"match":{"kind":"file"}}]}' | agent-
 ```
 
 ```
-agent-graph --db <path> [--origin <o>] [--privileged] [--read-only] <command> [json]
+agent-graph --db <path> [--origin <o>] [--privileged] [--trusted] [--read-only] <command> [json]
 ```
 
-Commands: `put`, `link`, `supersede`, `match`, `get`, `recall`, `recall-many`, `subgraph`, `trace`, `trace-edge`, `stats` — the same operations as the MCP tools below. Each takes one JSON object (`get`, `trace` and `trace-edge` also accept a bare id); when the argument is omitted and stdin is not a terminal, the JSON is read from stdin. Results are pretty-printed JSON on stdout; a failure is `{"error":{"name","message"}}` on stderr with exit status 1, so a shell-driven agent can tell a `GuardError` from a `PermissionError` from a typo. `--origin` stamps every write; `--read-only` refuses the write commands.
+Commands: `put`, `link`, `supersede`, `match`, `get`, `recall`, `recall-many`, `subgraph`, `trace`, `trace-edge`, `stats` — the same operations as the MCP tools below. Each takes one JSON object (`get`, `trace` and `trace-edge` also accept a bare id); when the argument is omitted and stdin is not a terminal, the JSON is read from stdin. Arguments are validated against the tool's schema before anything runs (`recordedAt: "yesterday"` is a `ValidationError` naming the field). Results are pretty-printed JSON on stdout; a failure is `{"error":{"name","message"}}` on stderr with exit status 1, so a shell-driven agent can tell a `GuardError` from a `PermissionError` from a `ValidationError` from a typo. `--origin` stamps every write; `--trusted` allows `provenance: "observed"` (for a runtime, not a model); `--read-only` refuses the write commands.
 
 ## MCP (Claude Code, Codex, anything that speaks MCP)
 
 The package ships an MCP server over stdio.
+
+The bin is `agent-graph-mcp`, shipped inside the `agent-graph` package, so `npx` needs `--package`.
 
 **Claude Code** — `.mcp.json` in your project (or `claude mcp add`):
 
@@ -88,7 +93,7 @@ The package ships an MCP server over stdio.
   "mcpServers": {
     "memory": {
       "command": "npx",
-      "args": ["-y", "agent-graph-mcp", "--db", "./memory.sqlite", "--origin", "claude"]
+      "args": ["-y", "--package=agent-graph", "agent-graph-mcp", "--db", "./memory.sqlite", "--origin", "claude"]
     }
   }
 }
@@ -99,14 +104,18 @@ The package ships an MCP server over stdio.
 ```toml
 [mcp_servers.memory]
 command = "npx"
-args = ["-y", "agent-graph-mcp", "--db", "./memory.sqlite", "--origin", "codex"]
+args = ["-y", "--package=agent-graph", "agent-graph-mcp", "--db", "./memory.sqlite", "--origin", "codex"]
 ```
 
-Tools exposed: `graph_put`, `graph_link`, `graph_supersede` (writes) and `graph_match`, `graph_get`, `graph_recall`, `graph_recall_many`, `graph_subgraph`, `graph_trace`, `graph_trace_edge`, `graph_stats` (reads). Pass `--read-only` to expose only the read tools. Every write is stamped with `--origin`; the tool descriptions explain the two time axes (`validAt`, `asOf`, `recordedBetween`) so a model can pick the slice it needs. The server is hand-rolled newline-delimited JSON-RPC over stdio (no SDK dependency), speaks protocol versions 2024-11-05 through 2025-06-18, and returns tool failures — guard rejections included — as `isError` results the model can read and recover from.
+Add `--read-only` to expose only the read tools, or `--trusted` when the server acts for a runtime that may record `provenance: "observed"` — by default an agent-driven session can only write `claimed`.
+
+Tools exposed: `graph_put`, `graph_link`, `graph_supersede` (writes) and `graph_match`, `graph_get`, `graph_recall`, `graph_recall_many`, `graph_subgraph`, `graph_trace`, `graph_trace_edge`, `graph_stats` (reads). Every write is stamped with `--origin`; the tool descriptions explain the two time axes (`validAt`, `asOf`, `recordedBetween`) so a model can pick the slice it needs, and every call is validated against the same schema the model was shown. The server is hand-rolled newline-delimited JSON-RPC over stdio (no SDK dependency), speaks protocol versions 2024-11-05 through 2025-06-18, and returns tool failures — guard rejections, permission refusals and schema violations included — as `isError` results the model can read and recover from.
 
 ## The model, in one paragraph
 
-A **node** is `{ id, kind, label, attrs }`; `put()` on an existing id appends a version, so history is kept. An **edge** is `{ src, dst, rel, cost, directed, scope, attrs, origin, provenance, validFrom, validTo, recordedAt, supersededAt, supersedes }`. `recall()` resolves entry points (by id, by exact match, or through an optional `Locator` you supply for semantic search), then runs a bounded cheapest-path walk, filtering edges by time, scope, relation and provenance, and returns each reachable node with its cost and path. `trace()` gives a node's versions and every edge ever attached to it; `traceEdge()` follows a supersession chain.
+A **node** is `{ id, kind, label, attrs }`; `put()` on an existing id appends a version, so history is kept. An **edge** is `{ src, dst, rel, cost, directed, scope, attrs, origin, provenance, validFrom, validTo, recordedAt, supersededAt, supersedes }`. `recall()` resolves entry points (by id, by exact match, or through an optional `Locator` you supply for semantic search), then runs a bounded cheapest-path walk, filtering edges by time, scope, relation and provenance, and returns each reachable node with its cost and path. `recallMany()` runs several of those on one load; its hits carry `nodeId` and the shared `nodes` map holds each record once. `trace()` gives a node's versions and every edge ever attached to it; `traceEdge()` follows a supersession chain.
+
+**World time defaults.** An edge with no `validFrom` is unbounded into the past: a fact asserted now may well have held before anyone recorded it, so a `validAt` query at any earlier instant still finds it. "Starts now" is not a default — pass `validFrom: Date.now()` when you mean it. No `validTo` means the fact still holds (an open edit window, a running job).
 
 ### Visualisation
 
@@ -123,6 +132,29 @@ A **node** is `{ id, kind, label, attrs }`; `put()` on an existing id appends a 
 
 Both give the same answer; the graph one also carries the path walked, each hop's provenance and origin, and, for the corrected claim, the round-2 view (`asOf`) next to the live one. Source: `examples/fleet/`.
 
+## Hosts without a persistent disk
+
+Some hosts (a serverless function, a container that is recycled, a sandbox) cannot keep the SQLite file. The graph therefore exposes its writes:
+
+```js
+import { openGraph, journalToSql } from 'agent-graph';
+
+// 1. Journal: every successful write, after commit, in commit order.
+const g = openGraph(':memory:', {
+  origin: 'run:7f3a', trusted: true,
+  journal: (op) => appendToDurableLog(JSON.stringify(op)),   // your append-only store
+});
+
+// 2. Replay at startup — needs a privileged AND trusted handle, because it writes
+//    other origins' records verbatim (their origin, provenance, recordedAt, ids).
+const boot = openGraph(':memory:', { origin: 'boot', privileged: true });
+const { applied, skipped } = boot.replay(readWholeLog().map(JSON.parse));
+```
+
+Every op is explicit — `put` carries the version as stored (merged attrs included), `link` and `supersede` carry the edge ids the graph minted — so a replay on any database reproduces the same rows. Replay is idempotent: an op already present (edge id exists, that put version already recorded, edge already superseded) is counted as `skipped`, so overlapping journals and re-runs are safe, and two writers' journals can be merged by `recordedAt` and replayed in either merge order. Guards still run (a journaled credential is refused with the op's index; ops before it stay applied, so fix the log and replay again). The journal hook is not called during a replay.
+
+Two more shapes for the same need. `journalToSql(op)` renders an op as the exact `INSERT`/`UPDATE` statements the store itself runs, for a host that keeps a remote SQL copy and would rather apply the writes there than hold a log. And `dump()` / `load(dump)` move whole tables as rows: `load` is privileged, atomic, guarded, and idempotent (append-only tables `INSERT OR IGNORE` by primary key; `nodes` keeps the higher version), so a host can hydrate from rows fetched elsewhere and write rows back.
+
 ## What it deliberately does not do (v1)
 
 - No semantic search in the core. Supply a `Locator` if you want free-text entry; the framework only needs it to return node ids.
@@ -131,9 +163,11 @@ Both give the same answer; the graph one also carries the path walked, each hop'
 
 ## Safety
 
-- Values that look like credentials (`sk-…`, `ghp_…`, `Bearer …`, AWS keys, …) are **rejected**, not stored — the write throws.
+- Values that look like credentials (`sk-…`, `ghp_…`, `Bearer …`, AWS keys, …) are **rejected**, not stored — the write throws, in every persisted string (id, kind, label, rel, scope, origin, attrs), and the error names the field and the pattern class, never the value.
 - Labels that read as instructions to a model ("ignore previous…", "you must…") are accepted but flagged, so a reader can tell.
-- A handle opened as one `origin` cannot supersede another origin's edges or re-label another origin's nodes. Open with `privileged: true` for maintenance.
+- `provenance: 'observed'` is a **trusted** claim: only a handle opened `trusted: true` (or a binary started with `--trusted`) may write it. An agent's session writes `claimed`, so a model cannot launder its conclusion into evidence.
+- A handle opened as one `origin` cannot supersede another origin's edges or re-label another origin's nodes; on someone else's node it may only **add** attrs whose keys are not there yet, and it never inherits their provenance. Open with `privileged: true` for maintenance.
+- `as()` only narrows: read-only is inherited and cannot be cleared, `privileged` needs a privileged parent, `trusted` needs a trusted or privileged parent, and only a privileged handle may derive a handle for a different origin. A read-only handle never writes — not even access counts.
 
 ## License
 

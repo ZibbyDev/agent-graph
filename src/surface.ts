@@ -1,6 +1,7 @@
 /**
  * Shared plumbing for the two binaries (CLI and MCP server): the handle
- * options both accept (`--db`, `--origin`, `--privileged`, `--read-only`),
+ * options both accept (`--db`, `--origin`, `--privileged`, `--trusted`,
+ * `--read-only`),
  * the package version, and the error → JSON shape.
  *
  * Hand-rolled: the package has no runtime dependencies.
@@ -13,6 +14,10 @@ export interface HandleArgs {
   db?: string;
   origin?: string;
   privileged: boolean;
+  /** The process is a runtime that saw things happen, so it may write
+   *  `provenance: 'observed'`. Off by default: a model-driven session can
+   *  only write `claimed`. */
+  trusted: boolean;
   readOnly: boolean;
   help: boolean;
   /** Everything that was not a recognised handle option, in order. */
@@ -25,7 +30,7 @@ export interface HandleArgs {
  * unrecognised arguments (the command, its JSON) in `rest` for the caller.
  */
 export function parseHandleArgs(argv: string[]): HandleArgs {
-  const out: HandleArgs = { privileged: false, readOnly: false, help: false, rest: [] };
+  const out: HandleArgs = { privileged: false, trusted: false, readOnly: false, help: false, rest: [] };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--') {
@@ -51,6 +56,9 @@ export function parseHandleArgs(argv: string[]): HandleArgs {
       case '--privileged':
         out.privileged = true;
         break;
+      case '--trusted':
+        out.trusted = true;
+        break;
       case '--read-only':
       case '--readonly':
         out.readOnly = true;
@@ -71,6 +79,7 @@ export function graphOptionsFrom(args: HandleArgs): GraphOptions {
   const opts: GraphOptions = {};
   if (args.origin !== undefined) opts.origin = args.origin;
   if (args.privileged) opts.privileged = true;
+  if (args.trusted) opts.trusted = true;
   if (args.readOnly) opts.readOnly = true;
   return opts;
 }
