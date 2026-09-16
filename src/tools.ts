@@ -200,6 +200,10 @@ const RECALL_QUERY_PROPERTIES: Record<string, JsonSchema> = {
     description: "'cost' (default) = closest first; 'recent' / 'oldest' = by the node's latest recordedAt.",
   },
   includeSeeds: { type: 'boolean', default: false, description: 'Include the seed nodes themselves as hits (cost 0, empty path). Default false.' },
+  project: {
+    type: 'string', enum: ['summary', 'full'], default: 'summary',
+    description: "How much of each hit to return. 'summary' (default here): id, kind, label, provenance, time and the path's relation names — enough to decide what to look at; fetch a node's attrs by id with graph_get or graph_trace. 'full': whole records including attrs — costs tokens, ask only when you need the payloads.",
+  },
   validAt: {
     type: 'integer',
     description:
@@ -364,7 +368,9 @@ const definitions: ToolDefinition[] = [
       ' Typical questions: "which files did this member touch" (seeds member, rels [performed_by, touched], kinds [file]); "who is editing these files right now" (seeds files, rels [touched], direction in, validAt now).',
     inputSchema: { ...RECALL_QUERY, description: 'One recall query.' },
     run(graph, args) {
-      return graph.recall(args as Parameters<Graph['recall']>[0]);
+      // The tool surface defaults to the summary projection (the schema's
+      // `default` is documentation; the validator does not fill it in).
+      return graph.recall({ project: 'summary', ...(args as Parameters<Graph['recall']>[0]) });
     },
   },
   {
@@ -384,7 +390,8 @@ const definitions: ToolDefinition[] = [
     run(graph, args) {
       const queries = args.queries;
       if (!Array.isArray(queries)) throw new TypeError('"queries" must be an array of recall queries');
-      return graph.recallMany(queries as Parameters<Graph['recallMany']>[0]);
+      const withDefault = (queries as Parameters<Graph['recallMany']>[0]).map((q) => ({ project: 'summary' as const, ...q }));
+      return graph.recallMany(withDefault);
     },
   },
   {
@@ -397,7 +404,7 @@ const definitions: ToolDefinition[] = [
       ' Slice with recordedBetween to render how an area grew round by round. Ids, kinds and rels are stable, so a renderer can key colour and shape on them.',
     inputSchema: { ...RECALL_QUERY, description: 'A recall query; the result is the subgraph induced by what it reaches.' },
     run(graph, args) {
-      return graph.subgraph(args as Parameters<Graph['subgraph']>[0]);
+      return graph.subgraph({ project: 'summary', ...(args as Parameters<Graph['subgraph']>[0]) });
     },
   },
   {

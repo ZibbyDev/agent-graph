@@ -201,23 +201,38 @@ export interface RecallQuery extends TimeFilter {
   order?: 'cost' | 'recent' | 'oldest';
   /** Include the seeds themselves in hits. Default false. */
   includeSeeds?: boolean;
+  /**
+   * How much of each hit to return. 'full' (default for the JS API) returns
+   * whole records; 'summary' returns only what a reader needs to decide
+   * what to look at — id, kind, label, provenance, time — and the path as
+   * relation names, never attrs. An agent pays per token, so the tool
+   * surfaces (CLI / MCP / HTTP) default to 'summary' and fetch details by id
+   * with `get` / `trace`.
+   */
+  project?: 'full' | 'summary';
 }
 
-export interface RecallHit {
-  node: NodeRecord;
+/** The summary projection of a node: enough to recognise it and decide
+ *  whether to `get()` it, never its payload. */
+export type NodeSummary = Pick<NodeRecord, 'id' | 'kind' | 'label' | 'provenance' | 'recordedAt' | 'version'>;
+/** The summary projection of an edge on a path. */
+export type EdgeSummary = Pick<EdgeRecord, 'id' | 'src' | 'dst' | 'rel' | 'cost' | 'provenance' | 'recordedAt'>;
+
+export interface RecallHit<N = NodeRecord, E = EdgeRecord> {
+  node: N;
   /** Accumulated cost of the cheapest path found. */
   cost: number;
   /** The edges walked, seed → node, in order. Empty for a seed. */
-  path: EdgeRecord[];
+  path: E[];
   /** Which seed this hit was reached from. */
   seed: NodeId;
 }
 
-export interface RecallResult {
+export interface RecallResult<N = NodeRecord, E = EdgeRecord> {
   query: RecallQuery;
   /** Resolved entry points after seeds/match/locate. */
   seeds: NodeId[];
-  hits: RecallHit[];
+  hits: RecallHit<N, E>[];
   /** True if `limit` cut the result. */
   truncated: boolean;
   /** How the seeds were found, for the caller's audit trail. */
@@ -226,30 +241,33 @@ export interface RecallResult {
 
 /** A hit inside a `recallMany` result: the node itself lives once in the
  *  shared `nodes` map, so a hit only names it. */
-export interface RecallManyHit {
+export interface RecallManyHit<E = EdgeRecord> {
   nodeId: NodeId;
   cost: number;
-  path: EdgeRecord[];
+  path: E[];
   seed: NodeId;
 }
+
+/** A recall query that asks for the summary projection. */
+export type SummaryQuery = RecallQuery & { project: 'summary' };
 
 /** Batch form: one DB load, N queries. Results stay grouped by query; the
  *  `nodes` map is the shared, deduplicated node set so a node reached by
  *  several queries is serialised exactly once (hits carry `nodeId`, not the
  *  record). */
-export interface RecallManyResult {
-  results: Array<Omit<RecallResult, 'hits'> & { hits: RecallManyHit[] }>;
-  nodes: Record<NodeId, NodeRecord>;
+export interface RecallManyResult<N = NodeRecord, E = EdgeRecord> {
+  results: Array<Omit<RecallResult<N, E>, 'hits'> & { hits: RecallManyHit<E>[] }>;
+  nodes: Record<NodeId, N>;
 }
 
 /** The induced subgraph around a recall: every reached node plus EVERY live
  *  edge (under the same filters) whose two endpoints were both reached — not
  *  only the path edges. This is what a visualiser consumes. */
-export interface Subgraph {
+export interface Subgraph<N = NodeRecord, E = EdgeRecord> {
   /** Resolved entry points, always included in `nodes`. */
   seeds: NodeId[];
-  nodes: NodeRecord[];
-  edges: EdgeRecord[];
+  nodes: N[];
+  edges: E[];
   /** True if `limit` cut the node set (edges are induced on the kept nodes). */
   truncated: boolean;
 }
@@ -441,12 +459,15 @@ export interface Graph {
   get(id: NodeId): Promise<NodeRecord | undefined>;
   getEdge(id: EdgeId): Promise<EdgeRecord | undefined>;
 
+  recall(q: SummaryQuery): Promise<RecallResult<NodeSummary, EdgeSummary>>;
   recall(q: RecallQuery): Promise<RecallResult>;
+  recallMany(qs: SummaryQuery[]): Promise<RecallManyResult<NodeSummary, EdgeSummary>>;
   recallMany(qs: RecallQuery[]): Promise<RecallManyResult>;
 
   /** Same seed resolution and bounded walk as `recall` (seeds always
    *  included), returning the induced subgraph instead of paths. Does not
    *  record access counts. */
+  subgraph(q: SummaryQuery): Promise<Subgraph<NodeSummary, EdgeSummary>>;
   subgraph(q: RecallQuery): Promise<Subgraph>;
 
   trace(id: NodeId): Promise<Trace>;

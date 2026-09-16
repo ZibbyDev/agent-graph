@@ -115,6 +115,10 @@ Add `--read-only` to expose only the read tools, or `--trusted` when the server 
 
 Tools exposed: `graph_put`, `graph_link`, `graph_supersede`, `graph_reembed` (writes) and `graph_match`, `graph_get`, `graph_recall`, `graph_recall_many`, `graph_subgraph`, `graph_trace`, `graph_trace_edge`, `graph_stats` (reads). Every write is stamped with `--origin`; the tool descriptions explain the two time axes (`validAt`, `asOf`, `recordedBetween`) so a model can pick the slice it needs, and every call is validated against the same schema the model was shown. The server is hand-rolled newline-delimited JSON-RPC over stdio (no SDK dependency), speaks protocol versions 2024-11-05 through 2025-06-18, and returns tool failures — guard rejections, permission refusals and schema violations included — as `isError` results the model can read and recover from.
 
+## Summaries first, payloads on demand
+
+A recall can return `project: 'summary'` hits — id, kind, label, provenance, time, and the path as relation names — instead of whole records. The CLI, MCP and HTTP surfaces **default to summary** because an agent pays per token and mostly needs to decide *what to look at*; it then fetches a node's attrs by id with `graph_get` / `graph_trace`, or asks `project: 'full'` when it really wants the payloads. The JS API keeps `full` as its default.
+
 ## The model, in one paragraph
 
 A **node** is `{ id, kind, label, attrs }`; `put()` on an existing id appends a version, so history is kept. An **edge** is `{ src, dst, rel, cost, directed, scope, attrs, origin, provenance, validFrom, validTo, recordedAt, supersededAt, supersedes }`. `recall()` resolves entry points (by id, by exact match, or by free text through the configured embeddings or a `Locator` you supply), then runs a bounded cheapest-path walk, filtering edges by time, scope, relation and provenance, and returns each reachable node with its cost and path. `recallMany()` runs several of those on one load; its hits carry `nodeId` and the shared `nodes` map holds each record once. `trace()` gives a node's versions and every edge ever attached to it; `traceEdge()` follows a supersession chain.

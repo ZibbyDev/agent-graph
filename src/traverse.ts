@@ -12,6 +12,8 @@ import type {
   RecallQuery,
   RecallResult,
   Subgraph,
+  EdgeSummary,
+  NodeSummary,
 } from './types.js';
 
 /**
@@ -397,7 +399,21 @@ export async function recall(ctx: HandleContext, q: RecallQuery): Promise<Recall
   // A read must not write: a read-only handle leaves the access table alone.
   if (!ctx.readOnly) await recordAccess(ctx, hits);
 
-  return { query: q, seeds, hits, truncated, seedSources };
+  // Projection is the LAST step: sorting, the limit and access counting all
+  // saw the full records, so 'summary' changes only what leaves the function.
+  const projected = q.project === 'summary'
+    ? hits.map((h) => ({ node: summarizeNode(h.node), cost: h.cost, path: h.path.map(summarizeEdge), seed: h.seed }))
+    : hits;
+  return { query: q, seeds, hits: projected as RecallHit[], truncated, seedSources };
+}
+
+/** What a reader needs to recognise a node and decide whether to fetch it. */
+export function summarizeNode(n: NodeRecord): NodeSummary {
+  return { id: n.id, kind: n.kind, label: n.label, provenance: n.provenance, recordedAt: n.recordedAt, version: n.version };
+}
+/** An edge on a path, without its payload. */
+export function summarizeEdge(e: EdgeRecord): EdgeSummary {
+  return { id: e.id, src: e.src, dst: e.dst, rel: e.rel, cost: e.cost, provenance: e.provenance, recordedAt: e.recordedAt };
 }
 
 /**
@@ -464,6 +480,9 @@ export async function subgraph(ctx: HandleContext, q: RecallQuery): Promise<Subg
   }
 
   const edges = await expander.edgesWithin(kept.map((n) => n.id));
+  if (q.project === 'summary') {
+    return { seeds, nodes: kept.map(summarizeNode), edges: edges.map(summarizeEdge), truncated } as unknown as Subgraph;
+  }
   return { seeds, nodes: kept, edges, truncated };
 }
 

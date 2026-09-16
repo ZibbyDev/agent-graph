@@ -585,15 +585,17 @@ class GraphHandle implements Graph {
 
   // -- retrieval ------------------------------------------------------------
 
-  async recall(q: RecallQuery): Promise<RecallResult> {
+  // The interface overloads on `project: 'summary'`; one implementation
+  // serves both shapes, so the implementation signatures are the wide ones.
+  async recall(q: RecallQuery): Promise<RecallResult<any, any>> {
     return recall(this.ctx(), q);
   }
 
-  async recallMany(qs: RecallQuery[]): Promise<RecallManyResult> {
+  async recallMany(qs: RecallQuery[]): Promise<RecallManyResult<any, any>> {
     return recallMany(this.ctx(), qs);
   }
 
-  async subgraph(q: RecallQuery): Promise<Subgraph> {
+  async subgraph(q: RecallQuery): Promise<Subgraph<any, any>> {
     return subgraph(this.ctx(), q);
   }
 
