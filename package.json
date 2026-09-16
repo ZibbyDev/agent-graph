@@ -1,0 +1,50 @@
+{
+  "name": "agent-graph",
+  "version": "0.1.0",
+  "description": "A growable, time-aware memory graph for AI agents. One SQLite file, zero runtime dependencies. JS API, CLI, and MCP server.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "bin": {
+    "agent-graph": "./dist/src/cli.js",
+    "agent-graph-mcp": "./dist/src/mcp.js"
+  },
+  "files": [
+    "dist/src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test dist/test/",
+    "example": "npm run build && node dist/examples/fleet/run.js",
+    "prepublishOnly": "npm test"
+  },
+  "keywords": [
+    "agent",
+    "memory",
+    "knowledge-graph",
+    "sqlite",
+    "mcp",
+    "temporal",
+    "llm"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ZibbyDev/agent-graph.git"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.0",
+    "typescript": "^5.6.0"
+  }
+}
