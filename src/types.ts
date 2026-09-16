@@ -58,6 +58,8 @@ export interface NodeRecord {
   /** Origin that created version 1. */
   createdBy: string;
   createdAt: number;
+  /** Set when a guard flagged this version's content (see `GuardReport`). */
+  flags: string[];
 }
 
 export interface EdgeInput {
@@ -182,6 +184,18 @@ export interface RecallManyResult {
   nodes: Record<NodeId, NodeRecord>;
 }
 
+/** The induced subgraph around a recall: every reached node plus EVERY live
+ *  edge (under the same filters) whose two endpoints were both reached — not
+ *  only the path edges. This is what a visualiser consumes. */
+export interface Subgraph {
+  /** Resolved entry points, always included in `nodes`. */
+  seeds: NodeId[];
+  nodes: NodeRecord[];
+  edges: EdgeRecord[];
+  /** True if `limit` cut the node set (edges are induced on the kept nodes). */
+  truncated: boolean;
+}
+
 export interface Trace {
   /** Latest version, or undefined if the id is unknown. */
   node?: NodeRecord;
@@ -273,6 +287,11 @@ export interface Graph {
 
   recall(q: RecallQuery): Promise<RecallResult>;
   recallMany(qs: RecallQuery[]): Promise<RecallManyResult>;
+
+  /** Same seed resolution and bounded walk as `recall` (seeds always
+   *  included), returning the induced subgraph instead of paths. Does not
+   *  record access counts. Async only because `locate` may be. */
+  subgraph(q: RecallQuery): Promise<Subgraph>;
 
   trace(id: NodeId): Trace;
   traceEdge(id: EdgeId): EdgeTrace;

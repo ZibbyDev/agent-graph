@@ -31,6 +31,8 @@ import { openGraph } from 'agent-graph';
 
 const g = openGraph('./memory.sqlite', { origin: 'run:7f3a' });
 
+// Every endpoint must exist before it can be linked — ids are yours to mint.
+g.put({ id: 'run:7f3a', kind: 'run', label: 'developer on ticket 292', provenance: 'observed' });
 g.put({ id: 'ticket:292', kind: 'ticket', label: 'Remove stale release note', provenance: 'observed' });
 g.put({ id: 'file:repo/src/marketplace.js', kind: 'file', label: 'src/marketplace.js', provenance: 'observed' });
 g.link({ src: 'run:7f3a', dst: 'file:repo/src/marketplace.js', rel: 'touched', cost: 1, provenance: 'observed' });
