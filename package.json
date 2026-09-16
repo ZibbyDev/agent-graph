@@ -26,7 +26,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "npm run build && node --test dist/test/",
+    "test": "npm run build && node --test 'dist/test/*.test.js'",
     "example": "npm run build && node dist/examples/fleet/run.js",
     "prepublishOnly": "npm test"
   },

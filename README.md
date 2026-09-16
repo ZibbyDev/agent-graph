@@ -62,14 +62,20 @@ await g.recallMany([
 ## Command line
 
 ```sh
-agent-graph --db memory.sqlite put   '{"id":"ticket:292","kind":"ticket","label":"…","provenance":"observed"}'
-agent-graph --db memory.sqlite link  '{"src":"run:7f3a","dst":"ticket:292","rel":"worked_on","provenance":"observed"}'
-agent-graph --db memory.sqlite recall '{"seeds":["ticket:292"],"maxCost":2}'
-agent-graph --db memory.sqlite trace ticket:292
+agent-graph --db memory.sqlite --origin run:7f3a put  '{"id":"ticket:292","kind":"ticket","label":"…","provenance":"observed"}'
+agent-graph --db memory.sqlite --origin run:7f3a link '{"src":"run:7f3a","dst":"ticket:292","rel":"worked_on","provenance":"observed"}'
+agent-graph --db memory.sqlite recall   '{"seeds":["ticket:292"],"maxCost":2}'
+agent-graph --db memory.sqlite trace    ticket:292
+agent-graph --db memory.sqlite subgraph '{"seeds":["ticket:292"],"maxCost":2}'
 agent-graph --db memory.sqlite stats
+echo '{"queries":[{"seeds":["ticket:292"]},{"match":{"kind":"file"}}]}' | agent-graph --db memory.sqlite recall-many
 ```
 
-All commands take JSON and print JSON, so any shell-driven agent can use them.
+```
+agent-graph --db <path> [--origin <o>] [--privileged] [--read-only] <command> [json]
+```
+
+Commands: `put`, `link`, `supersede`, `match`, `get`, `recall`, `recall-many`, `subgraph`, `trace`, `trace-edge`, `stats` — the same operations as the MCP tools below. Each takes one JSON object (`get`, `trace` and `trace-edge` also accept a bare id); when the argument is omitted and stdin is not a terminal, the JSON is read from stdin. Results are pretty-printed JSON on stdout; a failure is `{"error":{"name","message"}}` on stderr with exit status 1, so a shell-driven agent can tell a `GuardError` from a `PermissionError` from a typo. `--origin` stamps every write; `--read-only` refuses the write commands.
 
 ## MCP (Claude Code, Codex, anything that speaks MCP)
 
@@ -96,11 +102,26 @@ command = "npx"
 args = ["-y", "agent-graph-mcp", "--db", "./memory.sqlite", "--origin", "codex"]
 ```
 
-Tools exposed: `graph_put`, `graph_link`, `graph_supersede`, `graph_match`, `graph_recall`, `graph_recall_many`, `graph_trace`, `graph_stats`. Pass `--read-only` to expose only the read tools.
+Tools exposed: `graph_put`, `graph_link`, `graph_supersede` (writes) and `graph_match`, `graph_get`, `graph_recall`, `graph_recall_many`, `graph_subgraph`, `graph_trace`, `graph_trace_edge`, `graph_stats` (reads). Pass `--read-only` to expose only the read tools. Every write is stamped with `--origin`; the tool descriptions explain the two time axes (`validAt`, `asOf`, `recordedBetween`) so a model can pick the slice it needs. The server is hand-rolled newline-delimited JSON-RPC over stdio (no SDK dependency), speaks protocol versions 2024-11-05 through 2025-06-18, and returns tool failures — guard rejections included — as `isError` results the model can read and recover from.
 
 ## The model, in one paragraph
 
 A **node** is `{ id, kind, label, attrs }`; `put()` on an existing id appends a version, so history is kept. An **edge** is `{ src, dst, rel, cost, directed, scope, attrs, origin, provenance, validFrom, validTo, recordedAt, supersededAt, supersedes }`. `recall()` resolves entry points (by id, by exact match, or through an optional `Locator` you supply for semantic search), then runs a bounded cheapest-path walk, filtering edges by time, scope, relation and provenance, and returns each reachable node with its cost and path. `trace()` gives a node's versions and every edge ever attached to it; `traceEdge()` follows a supersession chain.
+
+### Visualisation
+
+`subgraph(query)` is the renderer's input: the nodes a `recall()` with the same query would reach, plus **every** live edge among them, not only the cheapest paths — "pick an area to view". Slice it with `recordedBetween` to animate how an area grew round by round; `asOf` replays what was believed at a point in time. Ids, kinds and rels are stable strings, so colour and shape can key on them. No renderer ships in v1; the CLI (`subgraph`) and the MCP tool (`graph_subgraph`) both export it as JSON.
+
+## Example: four questions a fleet manager asks
+
+`npm run example` builds a small fleet in memory — three members, three rounds of runs, tickets, files, one twice-returned ticket, one corrected claim, one run still editing — and answers, side by side with hand-written SQL over a flat `events` table built from the same facts:
+
+1. Which files did member X touch across the last three rounds, and do they overlap the files ticket T plans to touch?
+2. T was returned twice — where did it get stuck each time, by which run, when?
+3. T depends on D — who worked on D last round, and what was the outcome?
+4. Is anyone editing, right now, the files T plans to touch? (`validAt: now` — closed edit windows fall out of the walk.)
+
+Both give the same answer; the graph one also carries the path walked, each hop's provenance and origin, and, for the corrected claim, the round-2 view (`asOf`) next to the live one. Source: `examples/fleet/`.
 
 ## What it deliberately does not do (v1)
 

@@ -141,6 +141,13 @@ class GraphHandle implements Graph {
   private writeOrigin(explicit: string | undefined, what: string): string {
     this.assertOpen();
     if (this.readOnly) throw new PermissionError(`${what}: handle is read-only`);
+    // The origin on a write is an identity claim, and the whole permission
+    // model (ownership, supersede rights) hangs off it. A handle may therefore
+    // only write as itself; writing under another name — a manager recording
+    // on a member's behalf — is a privileged act.
+    if (explicit !== undefined && this.origin !== undefined && explicit !== this.origin && !this.privileged) {
+      throw new PermissionError(`${what}: handle '${this.origin}' cannot write as '${explicit}' (open with { privileged: true })`);
+    }
     const origin = explicit ?? this.origin;
     if (!origin) throw new Error(`${what}: an origin is required (open the graph with { origin } or pass it on the input)`);
     return origin;

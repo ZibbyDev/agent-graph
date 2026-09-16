@@ -79,6 +79,19 @@ describe('put — versions and ownership', () => {
     assert.equal(v.origin, 'ops');
   });
 
+  test('a handle cannot write under another origin unless privileged', () => {
+    const { g } = fixture('run:a');
+    assert.throws(
+      () => g.put({ id: 'ticket:1', kind: 'ticket', label: 'x', provenance: 'observed', origin: 'run:b' }),
+      PermissionError,
+    );
+    // The manager recording on a member's behalf is the sanctioned case.
+    const boss = g.as('manager', { privileged: true });
+    const n = boss.put({ id: 'ticket:1', kind: 'ticket', label: 'x', provenance: 'observed', origin: 'run:b' });
+    assert.equal(n.origin, 'run:b');
+    assert.equal(n.createdBy, 'run:b');
+  });
+
   test('a write needs an origin from the handle or the input', () => {
     const g = openGraph(':memory:');
     assert.throws(() => g.put({ id: 'n', kind: 'k', label: 'L', provenance: 'observed' }), /origin/);
