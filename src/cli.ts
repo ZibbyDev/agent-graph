@@ -134,13 +134,13 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   const toolArgs = await resolveArgs(tool, rawJson);
-  const graph = openGraph(args.db, graphOptionsFrom(args));
+  const graph = await openGraph(args.db, graphOptionsFrom(args));
   try {
     const result = await tool.run(graph, toolArgs);
     process.stdout.write(JSON.stringify(result ?? null, null, 2) + '\n');
     return 0;
   } finally {
-    graph.close();
+    await graph.close();
   }
 }
 

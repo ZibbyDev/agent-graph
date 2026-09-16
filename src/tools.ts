@@ -131,6 +131,12 @@ const MATCH_QUERY_PROPERTIES: Record<string, JsonSchema> = {
     additionalProperties: true,
     description: 'Every listed attribute must deep-equal (as JSON) the value on the node.',
   },
+  semantic: {
+    type: 'string',
+    description:
+      'Free text: the nodes whose embedding is nearest to it, most similar first; the other criteria then filter that list. ' +
+      'Only works when the graph was opened with an embedding model, and only finds nodes that were embedded (the deployment decides which kinds and which text). Errors otherwise.',
+  },
   limit: { type: 'integer', minimum: 1, description: 'Maximum number of nodes to return.' },
 };
 
@@ -140,15 +146,20 @@ const MATCH_QUERY: JsonSchema = {
   additionalProperties: false,
 };
 
-/** RecallQuery, documented field by field. `locate` is omitted: it needs a
- *  Locator wired in code, which neither the CLI nor the MCP server can do. */
+/** RecallQuery, documented field by field. */
 const RECALL_QUERY_PROPERTIES: Record<string, JsonSchema> = {
   seeds: {
     type: 'array',
     items: NODE_ID,
-    description: 'Entry points by node id. Union with `match`. At least one of `seeds` / `match` must resolve to a node.',
+    description: 'Entry points by node id. Union with `match` and `locate`. At least one of them must resolve to a node.',
   },
   match: { ...MATCH_QUERY, description: 'Entry points by exact match on kind / label / attrs (union with `seeds`).' },
+  locate: {
+    type: 'string',
+    description:
+      'Entry points by free text (union with `seeds` / `match`): the nodes nearest to this text by embedding, or through a host-supplied locator. ' +
+      'Only available when the graph was opened with an embedding model or a locator; errors otherwise. Prefer `seeds`/`match` when you know an id or an exact label.',
+  },
   maxCost: {
     type: 'number',
     minimum: 0,
@@ -427,6 +438,24 @@ const definitions: ToolDefinition[] = [
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     run(graph) {
       return graph.stats();
+    },
+  },
+  {
+    name: 'graph_reembed',
+    readOnly: false,
+    description:
+      'Recompute the embedding vectors of the selected nodes (latest versions) under the graph\'s current embedding rule — after the rule changed (different text, different kinds), or to backfill nodes written before embeddings were configured. ' +
+      'Nodes the rule excludes have their vector removed. Only available when the graph was opened with an embedding model. Returns { embedded, cleared, skipped }.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        kinds: { type: 'array', items: { type: 'string' }, description: 'Only nodes of these kinds. Omit for every kind the rule allows.' },
+        since: { type: 'integer', description: `Only nodes whose latest version was recorded at or after this instant. ${MS_EPOCH}` },
+      },
+      additionalProperties: false,
+    },
+    run(graph, args) {
+      return graph.reembed(args as Parameters<Graph['reembed']>[0]);
     },
   },
 ];

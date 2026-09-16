@@ -1,7 +1,7 @@
 {
   "name": "agent-graph",
-  "version": "0.1.0",
-  "description": "A growable, time-aware memory graph for AI agents. One SQLite file, zero runtime dependencies. JS API, CLI, and MCP server.",
+  "version": "0.2.0",
+  "description": "A growable, time-aware memory graph for AI agents. SQLite by default (zero runtime dependencies), Postgres optionally, configurable embeddings. JS API, CLI, MCP server, HTTP server.",
   "license": "MIT",
   "type": "module",
   "main": "./dist/src/index.js",
@@ -14,7 +14,8 @@
   },
   "bin": {
     "agent-graph": "./dist/src/cli.js",
-    "agent-graph-mcp": "./dist/src/mcp.js"
+    "agent-graph-mcp": "./dist/src/mcp.js",
+    "agent-graph-server": "./dist/src/server.js"
   },
   "files": [
     "dist/src",
@@ -37,7 +38,10 @@
     "sqlite",
     "mcp",
     "temporal",
-    "llm"
+    "llm",
+    "postgres",
+    "pgvector",
+    "embeddings"
   ],
   "repository": {
     "type": "git",
@@ -45,6 +49,16 @@
   },
   "devDependencies": {
     "@types/node": "^22.13.0",
+    "@types/pg": "^8.11.0",
+    "pg": "^8.11.3",
     "typescript": "^5.6.0"
+  },
+  "peerDependencies": {
+    "pg": ">=8"
+  },
+  "peerDependenciesMeta": {
+    "pg": {
+      "optional": true
+    }
   }
 }

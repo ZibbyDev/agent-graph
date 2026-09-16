@@ -27,6 +27,14 @@
  *     written by a read-only handle (a read must not write).
  *   - Every successful write can be JOURNALED and later REPLAYED verbatim,
  *     so a host with no persistent disk can rebuild the graph at startup.
+ *   - STORAGE IS A DRIVER (0.2.0). SQLite by default, Postgres optionally, one
+ *     SQL source rendered per dialect. Because Postgres is asynchronous, every
+ *     `Graph` method returns a Promise whichever driver is under it — an API
+ *     whose shape depended on the storage would be two APIs.
+ *   - WHAT GETS EMBEDDED IS THE CALLER'S DECISION. The core computes no
+ *     vector unless `embedding` is configured, and then only for the nodes
+ *     and the text the caller's rule selects — embedding everything is
+ *     usually not worth its cost.
  */
 
 export type Provenance = 'observed' | 'claimed';
@@ -159,6 +167,10 @@ export interface MatchQuery {
   labelContains?: string;
   /** Every listed attr must equal (deep-equal on JSON) the node's value. */
   attrs?: Record<string, unknown>;
+  /** Nearest nodes by embedding to this text (needs `embedding` on the
+   *  graph). Ranked by similarity; the other criteria then filter. Only nodes
+   *  that were embedded can match — see `EmbeddingConfig`. */
+  semantic?: string;
   limit?: number;
 }
 
@@ -167,8 +179,9 @@ export interface RecallQuery extends TimeFilter {
   seeds?: NodeId[];
   /** Entry points by exact match (union with `seeds`). */
   match?: MatchQuery;
-  /** Free-text entry through the configured `Locator` (union with the above).
-   *  Errors if no locator is configured. */
+  /** Free-text entry (union with the above): through the configured
+   *  `Locator` if there is one, else by embedding similarity when `embedding`
+   *  is configured. Errors when neither is. */
   locate?: string;
   /** Maximum accumulated edge cost from any seed. Default 2. */
   maxCost?: number;
@@ -269,10 +282,50 @@ export interface GraphStats {
   bytes: number;
 }
 
-/** Pluggable semantic entry. The core ships no implementation that needs a
- *  model; `locate` returns candidate node ids for free text. */
+/** Pluggable semantic entry, external to the graph: `locate` returns
+ *  candidate node ids for free text from wherever the host keeps its index.
+ *  The alternative is the built-in `embedding` below. */
 export interface Locator {
   locate(text: string, opts: { limit: number }): Promise<NodeId[]>;
+}
+
+/**
+ * Built-in embeddings — configured, never assumed. The three knobs exist
+ * because embedding every node of a busy graph costs real money and time for
+ * little: most nodes (a run, a file path) are found by id or exact match,
+ * and only a few kinds (a note, a ticket title, a conclusion) carry prose
+ * worth a vector.
+ */
+export interface EmbeddingConfig {
+  /** The model call. One request for many texts; the result is one vector per
+   *  text, in order, each of `dims` numbers. `openAiCompatibleEmbedder()`
+   *  builds one for any `/v1/embeddings` endpoint. */
+  embed(texts: string[]): Promise<number[][]>;
+  dims: number;
+  /** WHAT is embedded for a node. Default: the label only. Return `null` to
+   *  skip this node (its vector, if any, is removed). Combine label and the
+   *  attrs that matter to your queries; leave out ids, timestamps, blobs. */
+  text?: (node: NodeRecord) => string | null;
+  /** Only nodes of these kinds are embedded. Default: every kind. */
+  kinds?: string[];
+  /** The text is cut here before embedding. Default 2000 characters. */
+  maxChars?: number;
+}
+
+export interface ReembedOptions {
+  /** Restrict to these kinds (still subject to the configured `kinds`). */
+  kinds?: string[];
+  /** Only nodes whose latest version was recorded at or after this ms epoch. */
+  since?: number;
+}
+
+export interface ReembedResult {
+  /** Vectors written. */
+  embedded: number;
+  /** Vectors removed because the rule now returns null for the node. */
+  cleared: number;
+  /** Nodes the rule excluded that had no vector to remove. */
+  skipped: number;
 }
 
 /** What a guard did to a write. Guards never silently drop content: a
@@ -315,12 +368,23 @@ export interface GraphOptions {
    *  Sticky: every handle derived from it is read-only too. */
   readOnly?: boolean;
   locator?: Locator;
+  /** Built-in embeddings. Off unless given. Inherited by `as()`. */
+  embedding?: EmbeddingConfig;
   /** Clock, for tests. */
   now?: () => number;
   /** Called AFTER each successful write, in commit order, with the op that
    *  would reproduce it. Not called during `replay()`. Inherited by `as()`. */
   journal?: (op: JournalOp) => void;
+  /** Where non-fatal problems go (an embedding call that failed after a
+   *  write committed). Default: stderr. Never stdout — the MCP server owns it. */
+  log?: (line: string) => void;
 }
+
+/** Where a graph lives. A string is a SQLite file path (or `:memory:`). */
+export type OpenTarget =
+  | string
+  | { driver: 'sqlite'; path: string }
+  | { driver: 'postgres'; connectionString: string; schema?: string };
 
 export class GuardError extends Error {
   constructor(message: string, public readonly report: GuardReport) {
@@ -345,64 +409,81 @@ export class ValidationError extends Error {
   }
 }
 
+/**
+ * Every method is asynchronous (0.2.0): the same handle sits over SQLite or
+ * Postgres, and a shape that changed with the driver would be two APIs. Each
+ * write is one transaction — its reads (ownership, existence) and its rows
+ * commit together, so two concurrent writers cannot interleave inside one.
+ */
 export interface Graph {
   /** Upsert. A new id creates version 1. An existing id appends a version:
    *  the creating origin (or a privileged handle) may change anything; a
    *  different origin may only ADD attrs whose keys are not there yet (kind
    *  and label must match, an existing key with a different value is refused)
-   *  and gets no inherited provenance — it states one or writes `claimed`. */
-  put(node: Omit<NodeInput, 'origin' | 'provenance'> & Partial<Pick<NodeInput, 'origin' | 'provenance'>>): NodeRecord;
+   *  and gets no inherited provenance — it states one or writes `claimed`.
+   *  With `embedding` configured, the new version is embedded after commit
+   *  when the rule selects it; an embedding failure is logged, never thrown. */
+  put(node: Omit<NodeInput, 'origin' | 'provenance'> & Partial<Pick<NodeInput, 'origin' | 'provenance'>>): Promise<NodeRecord>;
 
   /** Append an assertion. Never merges with an existing edge. `id` may be
    *  pre-minted (must be unique). */
-  link(edge: Omit<EdgeInput, 'origin' | 'provenance' | 'supersedes'> & Partial<Pick<EdgeInput, 'origin' | 'provenance'>>): EdgeRecord;
+  link(edge: Omit<EdgeInput, 'origin' | 'provenance' | 'supersedes'> & Partial<Pick<EdgeInput, 'origin' | 'provenance'>>): Promise<EdgeRecord>;
 
   /** Retire an assertion. Permission: same origin as the edge, or privileged.
    *  With `replacement`, records the new assertion with `supersedes` set and
    *  returns it; without, returns the retired edge. */
-  supersede(edgeId: EdgeId, replacement?: Omit<EdgeInput, 'origin' | 'provenance' | 'supersedes'> & Partial<Pick<EdgeInput, 'origin' | 'provenance'>>): EdgeRecord;
+  supersede(edgeId: EdgeId, replacement?: Omit<EdgeInput, 'origin' | 'provenance' | 'supersedes'> & Partial<Pick<EdgeInput, 'origin' | 'provenance'>>): Promise<EdgeRecord>;
 
-  /** Exact lookup of nodes (latest versions). */
-  match(q: MatchQuery): NodeRecord[];
+  /** Exact lookup of nodes (latest versions); with `semantic`, nearest by
+   *  embedding first, then filtered. */
+  match(q: MatchQuery): Promise<NodeRecord[]>;
 
-  get(id: NodeId): NodeRecord | undefined;
-  getEdge(id: EdgeId): EdgeRecord | undefined;
+  get(id: NodeId): Promise<NodeRecord | undefined>;
+  getEdge(id: EdgeId): Promise<EdgeRecord | undefined>;
 
   recall(q: RecallQuery): Promise<RecallResult>;
   recallMany(qs: RecallQuery[]): Promise<RecallManyResult>;
 
   /** Same seed resolution and bounded walk as `recall` (seeds always
    *  included), returning the induced subgraph instead of paths. Does not
-   *  record access counts. Async only because `locate` may be. */
+   *  record access counts. */
   subgraph(q: RecallQuery): Promise<Subgraph>;
 
-  trace(id: NodeId): Trace;
-  traceEdge(id: EdgeId): EdgeTrace;
+  trace(id: NodeId): Promise<Trace>;
+  traceEdge(id: EdgeId): Promise<EdgeTrace>;
 
-  stats(): GraphStats;
+  stats(): Promise<GraphStats>;
 
   /** Re-apply journaled writes verbatim (origins, provenance, recordedAt and
    *  ids exactly as journaled), in the given order. Requires a privileged AND
    *  trusted handle. Idempotent: an op already present (edge id exists, put
    *  version already recorded, edge already superseded) is counted in
    *  `skipped`, so replaying overlapping journals is safe. Guards still run;
-   *  the journal hook is not invoked. */
-  replay(ops: JournalOp[]): { applied: number; skipped: number };
+   *  the journal hook is not invoked; nothing is embedded. */
+  replay(ops: JournalOp[]): Promise<{ applied: number; skipped: number }>;
 
-  /** Every row of every table, ordered by primary key. Any handle. */
-  dump(): GraphDump;
+  /** Every row of every table, ordered by primary key. Any handle. Vectors
+   *  are derived data and are not part of a dump — `reembed()` rebuilds them. */
+  dump(): Promise<GraphDump>;
 
   /** Bulk-insert rows from a `dump()`. Privileged only. Append-only tables
    *  (`node_versions`, `edges`, `access`) are INSERT OR IGNORE by primary key;
    *  `nodes` is upserted with the higher version winning — so loading the
    *  same dump twice changes nothing. Guards run on every row. Atomic. */
-  load(dump: GraphDump): { inserted: number; skipped: number };
+  load(dump: GraphDump): Promise<{ inserted: number; skipped: number }>;
+
+  /** Recompute vectors under the current `embedding` rule for the selected
+   *  nodes (latest versions): the way to change WHAT is embedded after the
+   *  fact. Needs a writable handle with `embedding` configured. */
+  reembed(opts?: ReembedOptions): Promise<ReembedResult>;
 
   /** A handle over the same database that can only NARROW this one: read-only
    *  is inherited and cannot be cleared; `privileged` needs a privileged
    *  parent; `trusted` needs a trusted or privileged parent; a different
-   *  origin needs a privileged parent. Violations throw `PermissionError`. */
+   *  origin needs a privileged parent. Violations throw `PermissionError`.
+   *  Synchronous: it opens nothing. */
   as(origin: string, opts?: Omit<GraphOptions, 'origin' | 'journal'>): Graph;
 
-  close(): void;
+  /** Close the connection for this handle and every handle derived from it. */
+  close(): Promise<void>;
 }

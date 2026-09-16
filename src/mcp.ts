@@ -261,7 +261,7 @@ export function usage(): string {
   ].join('\n');
 }
 
-export function main(argv: string[]): void {
+export async function main(argv: string[]): Promise<void> {
   const args = parseHandleArgs(argv);
   if (args.help) {
     process.stdout.write(usage() + '\n');
@@ -270,23 +270,24 @@ export function main(argv: string[]): void {
   if (args.rest.length > 0) throw new UsageError(`unexpected arguments: ${args.rest.join(' ')}`);
   if (!args.db) throw new UsageError('--db <path> is required');
 
-  const graph = openGraph(args.db, graphOptionsFrom(args));
   const log = (line: string) => process.stderr.write(`[agent-graph-mcp] ${line}\n`);
+  const graph = await openGraph(args.db, { ...graphOptionsFrom(args), log });
   const server = new McpServer(graph, args.readOnly, log);
 
   let closed = false;
   const shutdown = (code: number) => {
     if (closed) return;
     closed = true;
-    try {
-      graph.close();
-    } catch (err) {
-      log(`close failed: ${(err as Error).message}`);
-    }
-    // Let anything already queued on stdout drain before exiting: on some
-    // platforms pipe writes are asynchronous and a bare exit would truncate
-    // the last response.
-    process.stdout.write('', () => process.exit(code));
+    graph.close().then(
+      // Let anything already queued on stdout drain before exiting: on some
+      // platforms pipe writes are asynchronous and a bare exit would truncate
+      // the last response.
+      () => process.stdout.write('', () => process.exit(code)),
+      (err: unknown) => {
+        log(`close failed: ${(err as Error).message}`);
+        process.stdout.write('', () => process.exit(code));
+      },
+    );
   };
   process.on('SIGINT', () => shutdown(0));
   process.on('SIGTERM', () => shutdown(0));
@@ -306,13 +307,11 @@ function invokedAsBinary(): boolean {
 }
 
 if (invokedAsBinary()) {
-  try {
-    main(process.argv.slice(2));
-  } catch (err) {
+  main(process.argv.slice(2)).catch((err: unknown) => {
     // Startup failures (bad flags, unopenable database) go to stderr as the
     // same error object the CLI uses; the client sees a clean exit 1.
     process.stderr.write(JSON.stringify({ error: errorToJson(err) }) + '\n');
     if (err instanceof UsageError) process.stderr.write(usage() + '\n');
     process.exitCode = 1;
-  }
+  });
 }

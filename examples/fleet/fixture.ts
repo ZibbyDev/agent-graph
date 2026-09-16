@@ -354,10 +354,10 @@ export interface Fixture {
  * handle is derived trusted but not privileged — which is exactly why Bo's
  * attempt to retire Ada's claim is refused below.
  */
-export function buildGraph(path = ':memory:'): Fixture {
+export async function buildGraph(path = ':memory:'): Promise<Fixture> {
   const facts = fleetFacts();
   const clock = new Clock(R1);
-  const root = openGraph(path, { origin: MANAGER, privileged: true, now: clock.now });
+  const root = await openGraph(path, { origin: MANAGER, privileged: true, now: clock.now });
   const handles = new Map<string, Graph>();
   const as = (origin: string, privileged = false): Graph => {
     const k = `${origin}|${privileged}`;
@@ -375,10 +375,10 @@ export function buildGraph(path = ':memory:'): Fixture {
   for (const fact of facts) {
     clock.set(fact.at);
     if ('node' in fact) {
-      as(fact.by).put(fact.node);
+      await as(fact.by).put(fact.node);
     } else if ('edge' in fact) {
       const { key, ...input } = fact.edge;
-      const rec = as(fact.by).link(input);
+      const rec = await as(fact.by).link(input);
       if (key) edgeIds[key] = rec.id;
     } else {
       const target = edgeIds[fact.supersede.key];
@@ -386,7 +386,7 @@ export function buildGraph(path = ':memory:'): Fixture {
       const handle = as(fact.by, fact.privileged ?? false);
       const replacement = fact.supersede.replacement;
       try {
-        const rec = replacement ? handle.supersede(target, stripKey(replacement)) : handle.supersede(target);
+        const rec = replacement ? await handle.supersede(target, stripKey(replacement)) : await handle.supersede(target);
         if (fact.expectDenied) throw new Error(`fixture: expected ${fact.expectDenied} for ${fact.by} superseding ${fact.supersede.key}`);
         if (replacement?.key) edgeIds[replacement.key] = rec.id;
       } catch (err) {

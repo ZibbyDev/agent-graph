@@ -28,8 +28,9 @@ const ALL_TOOLS = [
   'graph_trace',
   'graph_trace_edge',
   'graph_stats',
+  'graph_reembed',
 ].sort();
-const READ_TOOLS = ALL_TOOLS.filter((n) => !['graph_put', 'graph_link', 'graph_supersede'].includes(n));
+const READ_TOOLS = ALL_TOOLS.filter((n) => !['graph_put', 'graph_link', 'graph_supersede', 'graph_reembed'].includes(n));
 
 interface Response {
   jsonrpc: string;

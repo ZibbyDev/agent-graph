@@ -57,17 +57,17 @@ describe('fleet example', () => {
   let fx: Fixture;
   let db: ReturnType<typeof buildFlat>;
 
-  before(() => {
-    fx = buildGraph();
+  before(async () => {
+    fx = await buildGraph();
     db = buildFlat(fx.facts);
   });
-  after(() => {
-    fx.graph.close();
+  after(async () => {
+    await fx.graph.close();
     db.close();
   });
 
-  it('builds the scenario: three rounds, one refused supersede', () => {
-    const s = fx.graph.stats();
+  it('builds the scenario: three rounds, one refused supersede', async () => {
+    const s = await fx.graph.stats();
     assert.equal(s.kinds.member, 3);
     assert.equal(s.kinds.ticket, 5);
     assert.equal(s.kinds.file, 5);
@@ -161,7 +161,7 @@ describe('fleet example', () => {
     const atCorrection = await claimsGraph(fx.graph, R2 + 3 * HOUR);
     assert.deepEqual(atCorrection.notes.map((n) => n.note), [NOTE_CLAIM_2]);
 
-    const chain = fx.graph.traceEdge(fx.edgeIds[CLAIM_EDGE_1]).chain;
+    const chain = (await fx.graph.traceEdge(fx.edgeIds[CLAIM_EDGE_1])).chain;
     assert.deepEqual(chain.map((e) => e.id), [fx.edgeIds[CLAIM_EDGE_1], fx.edgeIds[CLAIM_EDGE_2]]);
     assert.equal(chain[0].supersededAt, R2 + 3 * HOUR);
     assert.equal(chain[1].supersededAt, null);

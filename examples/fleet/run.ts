@@ -48,11 +48,12 @@ function section(label: 'graph' | 'sql' | 'note', lines: string[]): void {
 }
 
 async function main(): Promise<void> {
-  const fx = buildGraph();
+  const fx = await buildGraph();
   const g = fx.graph;
   const db = buildFlat(fx.facts);
 
-  out(`agent-graph fleet demo — ${g.stats().nodes} nodes, ${g.stats().edges} edges over three rounds; asking at ${fmtTime(NOW)}`);
+  const stats = await g.stats();
+  out(`agent-graph fleet demo — ${stats.nodes} nodes, ${stats.edges} edges over three rounds; asking at ${fmtTime(NOW)}`);
   out(`Fleet: Ada, Bo, Cy on acme/shop. T = ${T} "Apply coupon at checkout"; D = ${D} "expose discount API".`);
 
   // ── Q1 ──────────────────────────────────────────────────────────────────
@@ -137,7 +138,7 @@ async function main(): Promise<void> {
   section('graph', [
     `asOf ${fmtTime(ROUND2_EARLY)}: ${early.notes.map((n) => `"${n.label}" (via ${short(n.via)})`).join('; ') || 'nothing'}`,
     `live view:            ${live.notes.map((n) => `"${n.label}" (via ${short(n.via)}, supersedes ${n.supersedes ? 'the round-1 claim' : 'nothing'})`).join('; ') || 'nothing'}`,
-    `chain: ${g.traceEdge(fx.edgeIds[CLAIM_EDGE_1]).chain.map((e) => `${short(e.src)}→${short(e.dst)}${e.supersededAt ? ` (retired ${fmtTime(e.supersededAt)})` : ' (live)'}`).join('  ⇒  ')}`,
+    `chain: ${(await g.traceEdge(fx.edgeIds[CLAIM_EDGE_1])).chain.map((e) => `${short(e.src)}→${short(e.dst)}${e.supersededAt ? ` (retired ${fmtTime(e.supersededAt)})` : ' (live)'}`).join('  ⇒  ')}`,
     `who could correct it: ${fx.denied.map((d) => `${d.by} was refused (${d.error.split(':')[0]}); the privileged manager handle recorded the correction`).join('; ')}`,
   ]);
   section('sql', [
@@ -158,7 +159,7 @@ async function main(): Promise<void> {
   ]);
 
   out();
-  g.close();
+  await g.close();
   db.close();
 }
 

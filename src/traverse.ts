@@ -1,4 +1,5 @@
-import type { HandleContext, Store } from './graph.js';
+import { semanticLocate } from './embedding.js';
+import type { HandleContext } from './graph.js';
 import { rowToEdge, rowToNode, SQL, type SqlRow } from './schema.js';
 import type {
   EdgeRecord,
@@ -28,6 +29,9 @@ import type {
  * after T does not exist — not as a seed, not as a match, not as a hit. Every
  * node read in a query therefore goes through `nodeAt(id, q.asOf)`; with no
  * `asOf` that is the plain latest-version lookup.
+ *
+ * Everything here is asynchronous because the store is (see driver.ts). The
+ * walk itself is unchanged: one `await` per frontier expansion.
  */
 
 const DEFAULT_MAX_COST = 2;
@@ -60,14 +64,18 @@ async function resolveSeeds(
   // merely suspects exist ("the file this ticket will touch"), and a batch of
   // questions should not fail because one guess was wrong. The audit trail
   // (`seedSources`) shows what actually resolved.
-  for (const id of q.seeds ?? []) if (ctx.store.nodeAt(id, q.asOf)) add(id, 'seed');
+  for (const id of q.seeds ?? []) if (await ctx.store.nodeAt(id, q.asOf)) add(id, 'seed');
 
-  if (q.match) for (const n of matchNodes(ctx.store, q.match, q.asOf)) add(n.id, 'match');
+  if (q.match) for (const n of await matchNodes(ctx, q.match, q.asOf)) add(n.id, 'match');
 
   if (q.locate !== undefined) {
-    if (!ctx.locator) throw new Error('recall: `locate` given but no locator is configured on this graph');
-    const ids = await ctx.locator.locate(q.locate, { limit: q.limit ?? DEFAULT_LIMIT });
-    for (const id of ids) if (ctx.store.nodeAt(id, q.asOf)) add(id, 'locate');
+    const limit = q.limit ?? DEFAULT_LIMIT;
+    // An external locator, when the host has one, wins over the built-in
+    // embeddings: it was wired on purpose and may index more than labels.
+    const ids = ctx.locator
+      ? await ctx.locator.locate(q.locate, { limit })
+      : await semanticLocate(ctx, q.locate, { limit, asOf: q.asOf });
+    for (const id of ids) if (await ctx.store.nodeAt(id, q.asOf)) add(id, 'locate');
   }
 
   return { seeds: seedSources.map((s) => s.id), seedSources };
@@ -79,8 +87,33 @@ async function resolveSeeds(
  * "matches" means. With `asOf` it matches against the version of each node
  * current at that instant (read from `node_versions`); without, against the
  * denormalised latest versions in `nodes`.
+ *
+ * With `semantic`, the candidates come from the embedding index (nearest
+ * first, kind pushed into that query) and the remaining criteria filter them
+ * in that order — so a semantic match is "the closest nodes that also satisfy
+ * label/attrs", never a re-sort.
  */
-export function matchNodes(store: Store, q: MatchQuery, asOf: number | undefined): NodeRecord[] {
+export async function matchNodes(ctx: HandleContext, q: MatchQuery, asOf: number | undefined): Promise<NodeRecord[]> {
+  const limit = q.limit ?? 100;
+  const attrKeys = q.attrs ? Object.keys(q.attrs) : [];
+  const passes = (node: NodeRecord): boolean => {
+    if (q.kind !== undefined && node.kind !== q.kind) return false;
+    if (q.label !== undefined && node.label !== q.label) return false;
+    if (q.labelContains !== undefined && !node.label.toLowerCase().includes(q.labelContains.toLowerCase())) return false;
+    return attrKeys.every((k) => canonical(node.attrs[k]) === canonical(q.attrs![k]));
+  };
+
+  if (q.semantic !== undefined) {
+    const ids = await semanticLocate(ctx, q.semantic, { kinds: q.kind !== undefined ? [q.kind] : undefined, asOf, limit });
+    const out: NodeRecord[] = [];
+    for (const id of ids) {
+      const node = await ctx.store.nodeAt(id, asOf);
+      if (node && passes(node)) out.push(node);
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
+
   const where: string[] = [];
   const params: Array<string | number> = [];
   if (q.kind !== undefined) { where.push('v.kind = ?'); params.push(q.kind); }
@@ -90,8 +123,6 @@ export function matchNodes(store: Store, q: MatchQuery, asOf: number | undefined
     where.push('instr(lower(v.label), lower(?)) > 0');
     params.push(q.labelContains);
   }
-  const limit = q.limit ?? 100;
-  const attrKeys = q.attrs ? Object.keys(q.attrs) : [];
   let sql: string;
   if (asOf === undefined) {
     sql = `SELECT v.* FROM nodes v${where.length ? ' WHERE ' + where.join(' AND ') : ''} ORDER BY v.id`;
@@ -110,7 +141,7 @@ export function matchNodes(store: Store, q: MatchQuery, asOf: number | undefined
   // matter), so the SQL LIMIT is only safe when no attr filter follows it.
   if (attrKeys.length === 0) { sql += ' LIMIT ?'; params.push(limit); }
   const out: NodeRecord[] = [];
-  for (const r of store.db.prepare(sql).iterate(...params)) {
+  for (const r of await ctx.store.driver.all(sql, params)) {
     const node = rowToNode(r as SqlRow);
     if (attrKeys.length && !attrKeys.every((k) => canonical(node.attrs[k]) === canonical(q.attrs![k]))) continue;
     out.push(node);
@@ -131,13 +162,13 @@ export function canonical(v: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// Edge expansion: one prepared statement per query, bound per frontier node.
+// Edge expansion: one statement per query, bound per frontier node.
 
 interface Expander {
   /** Live edges incident on `node` under every filter, direction applied. */
-  edgesFrom(node: NodeId): EdgeRecord[];
+  edgesFrom(node: NodeId): Promise<EdgeRecord[]>;
   /** Live edges under every filter whose BOTH endpoints are in `ids`. */
-  edgesWithin(ids: NodeId[]): EdgeRecord[];
+  edgesWithin(ids: NodeId[]): Promise<EdgeRecord[]>;
 }
 
 function buildExpander(ctx: HandleContext, q: RecallQuery): Expander {
@@ -192,16 +223,14 @@ function buildExpander(ctx: HandleContext, q: RecallQuery): Expander {
   const common = filters.join(' AND ');
   // Ordering by recorded_at makes tie-breaking deterministic without a sort
   // in JS: among equal-cost relaxations the earlier-recorded edge wins.
-  const perNode = ctx.store.db.prepare(
-    `SELECT * FROM edges WHERE ${incident} AND ${common} ORDER BY recorded_at ASC, id ASC`,
-  );
+  const perNode = `SELECT * FROM edges WHERE ${incident} AND ${common} ORDER BY recorded_at ASC, id ASC`;
 
   return {
-    edgesFrom(node) {
+    async edgesFrom(node) {
       const bind = incidentArity === 2 ? [node, node] : [node, node, node];
-      return (perNode.all(...bind, ...params) as SqlRow[]).map(rowToEdge);
+      return (await ctx.store.driver.all(perNode, [...bind, ...params])).map(rowToEdge);
     },
-    edgesWithin(ids) {
+    async edgesWithin(ids) {
       if (ids.length === 0) return [];
       const inSet = new Set(ids);
       const out: EdgeRecord[] = [];
@@ -210,9 +239,10 @@ function buildExpander(ctx: HandleContext, q: RecallQuery): Expander {
       const CHUNK = 500;
       for (let i = 0; i < ids.length; i += CHUNK) {
         const slice = ids.slice(i, i + CHUNK);
-        const rows = ctx.store.db
-          .prepare(`SELECT * FROM edges WHERE src IN (${placeholders(slice.length)}) AND ${common} ORDER BY recorded_at ASC, id ASC`)
-          .all(...slice, ...params) as SqlRow[];
+        const rows = await ctx.store.driver.all(
+          `SELECT * FROM edges WHERE src IN (${placeholders(slice.length)}) AND ${common} ORDER BY recorded_at ASC, id ASC`,
+          [...slice, ...params],
+        );
         for (const r of rows) if (inSet.has(r.dst as string)) out.push(rowToEdge(r));
       }
       return out;
@@ -281,7 +311,7 @@ function less(x: HeapEntry, y: HeapEntry): boolean {
  * the budget, not by the size of the graph — a hub with a thousand cheap
  * neighbours is only expanded if the budget actually reaches it.
  */
-function walk(expander: Expander, seeds: NodeId[], maxCost: number): Map<NodeId, Settled> {
+async function walk(expander: Expander, seeds: NodeId[], maxCost: number): Promise<Map<NodeId, Settled>> {
   const best = new Map<NodeId, Settled>();
   const done = new Set<NodeId>();
   const heap = new MinHeap();
@@ -299,7 +329,7 @@ function walk(expander: Expander, seeds: NodeId[], maxCost: number): Map<NodeId,
     if (settled.cost !== cur.cost) continue; // stale entry
     done.add(cur.node);
 
-    for (const e of expander.edgesFrom(cur.node)) {
+    for (const e of await expander.edgesFrom(cur.node)) {
       const next = e.src === cur.node ? e.dst : e.src;
       if (next === cur.node) continue; // self-loop: nothing to reach
       const cost = settled.cost + e.cost;
@@ -335,7 +365,7 @@ function pathTo(best: Map<NodeId, Settled>, node: NodeId): EdgeRecord[] {
 export async function recall(ctx: HandleContext, q: RecallQuery): Promise<RecallResult> {
   const { seeds, seedSources } = await resolveSeeds(ctx, q);
   const expander = buildExpander(ctx, q);
-  const best = walk(expander, seeds, q.maxCost ?? DEFAULT_MAX_COST);
+  const best = await walk(expander, seeds, q.maxCost ?? DEFAULT_MAX_COST);
 
   const seedSet = new Set(seeds);
   const kinds = q.kinds ? new Set(q.kinds) : undefined;
@@ -345,7 +375,7 @@ export async function recall(ctx: HandleContext, q: RecallQuery): Promise<Recall
     if (seedSet.has(id) && !q.includeSeeds) continue;
     // Absent only when the node's first version postdates asOf (an edge can
     // be back-filled earlier than its endpoint): it did not exist then.
-    const node = ctx.store.nodeAt(id, q.asOf);
+    const node = await ctx.store.nodeAt(id, q.asOf);
     if (!node) continue;
     if (kinds && !kinds.has(node.kind)) continue;
     hits.push({ node, cost: s.cost, path: pathTo(best, id), seed: s.seed });
@@ -365,7 +395,7 @@ export async function recall(ctx: HandleContext, q: RecallQuery): Promise<Recall
   if (truncated) hits = hits.slice(0, limit);
 
   // A read must not write: a read-only handle leaves the access table alone.
-  if (!ctx.readOnly) recordAccess(ctx, hits);
+  if (!ctx.readOnly) await recordAccess(ctx, hits);
 
   return { query: q, seeds, hits, truncated, seedSources };
 }
@@ -401,13 +431,13 @@ export async function recallMany(ctx: HandleContext, qs: RecallQuery[]): Promise
 export async function subgraph(ctx: HandleContext, q: RecallQuery): Promise<Subgraph> {
   const { seeds } = await resolveSeeds(ctx, q);
   const expander = buildExpander(ctx, q);
-  const best = walk(expander, seeds, q.maxCost ?? DEFAULT_MAX_COST);
+  const best = await walk(expander, seeds, q.maxCost ?? DEFAULT_MAX_COST);
   const kinds = q.kinds ? new Set(q.kinds) : undefined;
   const seedSet = new Set(seeds);
 
   let nodes: Array<{ node: NodeRecord; cost: number }> = [];
   for (const [id, s] of best) {
-    const node = ctx.store.nodeAt(id, q.asOf);
+    const node = await ctx.store.nodeAt(id, q.asOf);
     if (!node) continue;
     // `kinds` shapes what is returned around the seeds; the seeds themselves
     // are the centre of the picture and stay whatever their kind.
@@ -433,7 +463,7 @@ export async function subgraph(ctx: HandleContext, q: RecallQuery): Promise<Subg
     else truncated = true;
   }
 
-  const edges = expander.edgesWithin(kept.map((n) => n.id));
+  const edges = await expander.edgesWithin(kept.map((n) => n.id));
   return { seeds, nodes: kept, edges, truncated };
 }
 
@@ -441,13 +471,13 @@ export async function subgraph(ctx: HandleContext, q: RecallQuery): Promise<Subg
 
 /** Bump `access` for every edge of every returned path, in one transaction.
  *  Recorded only — nothing reads it back for ranking (see README). */
-function recordAccess(ctx: HandleContext, hits: RecallHit[]): void {
+async function recordAccess(ctx: HandleContext, hits: RecallHit[]): Promise<void> {
   const t = ctx.now();
   const ids: string[] = [];
   for (const h of hits) for (const e of h.path) ids.push(e.id);
   if (ids.length === 0) return;
-  ctx.store.transaction(() => {
-    for (const id of ids) ctx.store.run({ sql: SQL.bumpAccess, params: [id, t] });
+  await ctx.store.transaction(async () => {
+    for (const id of ids) await ctx.store.driver.run(SQL.bumpAccess, [id, t]);
   });
 }
 

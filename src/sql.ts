@@ -14,8 +14,9 @@
  * content, not the derived flags.
  */
 
+import type { Dialect } from './driver.js';
 import { collectFlags } from './guards.js';
-import { rowParams, SQL } from './schema.js';
+import { renderSql, rowParams, SQL } from './schema.js';
 import type { EdgeId, EdgeInput, EdgeRecord, JournalOp, NodeInput, NodeRecord, Row, SqlStatement } from './types.js';
 
 /** A node version with every field decided (what `put` stores). */
@@ -96,27 +97,34 @@ export function nodeRecordFrom(n: ResolvedNode, version: number, createdBy: stri
  * order. Pure. For a `put` the node's lineage (`created_by`, `created_at`) is
  * taken from the op itself; it is only stored when the row is NEW, which for
  * a complete journal is exactly version 1 — the same op that created it.
+ *
+ * `dialect` picks the SQL flavour for a host that applies the statements to
+ * its own database: SQLite (default, `?` placeholders) or Postgres (`$n`,
+ * `ON CONFLICT DO NOTHING`). Same statements, same order, either way.
  */
-export function journalToSql(op: JournalOp): SqlStatement[] {
-  switch (op.op) {
-    case 'put': {
-      const n = explicitNode(op.input);
-      return nodeStatements(n, op.version, n.origin, n.recordedAt, nodeFlags(n));
+export function journalToSql(op: JournalOp, dialect: Dialect = 'sqlite'): SqlStatement[] {
+  const statements = ((): SqlStatement[] => {
+    switch (op.op) {
+      case 'put': {
+        const n = explicitNode(op.input);
+        return nodeStatements(n, op.version, n.origin, n.recordedAt, nodeFlags(n));
+      }
+      case 'link': {
+        const e = edgeRecordFrom(op.input, null, explicitTime(op.input.recordedAt, 'link'));
+        return [edgeStatement(e)];
+      }
+      case 'supersede': {
+        if (!op.replacement) return [retireStatement(op.edgeId, op.at, null)];
+        const fresh = edgeRecordFrom(op.replacement, op.edgeId, op.at);
+        // Same order as the store: the replacement exists before the old edge
+        // points at it, so a reader between the two never follows a dangling id.
+        return [edgeStatement(fresh), retireStatement(op.edgeId, op.at, fresh.id)];
+      }
+      default:
+        throw new Error(`journalToSql: unknown op '${String((op as { op?: unknown }).op)}'`);
     }
-    case 'link': {
-      const e = edgeRecordFrom(op.input, null, explicitTime(op.input.recordedAt, 'link'));
-      return [edgeStatement(e)];
-    }
-    case 'supersede': {
-      if (!op.replacement) return [retireStatement(op.edgeId, op.at, null)];
-      const fresh = edgeRecordFrom(op.replacement, op.edgeId, op.at);
-      // Same order as the store: the replacement exists before the old edge
-      // points at it, so a reader between the two never follows a dangling id.
-      return [edgeStatement(fresh), retireStatement(op.edgeId, op.at, fresh.id)];
-    }
-    default:
-      throw new Error(`journalToSql: unknown op '${String((op as { op?: unknown }).op)}'`);
-  }
+  })();
+  return dialect === 'sqlite' ? statements : statements.map((s) => ({ sql: renderSql(s.sql, dialect), params: s.params }));
 }
 
 function explicitNode(n: NodeInput): ResolvedNode {
