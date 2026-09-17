@@ -20,7 +20,7 @@ Most agent-memory systems answer this with a flat list of "facts" ranked by rece
 ## Install
 
 ```sh
-npm install agent-graph-memory
+npm install @zibby/agent-graph-memory
 npm install pg          # only if you want the Postgres driver
 ```
 
@@ -31,7 +31,7 @@ Requires Node ≥ 22.13 (uses the built-in `node:sqlite`).
 Every method returns a Promise — the same handle sits over SQLite or Postgres (see [Storage drivers](#storage-drivers)).
 
 ```js
-import { openGraph } from 'agent-graph-memory';
+import { openGraph } from '@zibby/agent-graph-memory';
 
 // `trusted` because this code IS the runtime: it may record what it observed.
 // A handle without it (an agent's MCP session) can only write `claimed`.
@@ -97,7 +97,7 @@ The bin is `agent-graph-mcp`, shipped inside the `agent-graph` package, so `npx`
   "mcpServers": {
     "memory": {
       "command": "npx",
-      "args": ["-y", "--package=agent-graph-memory", "agent-graph-mcp", "--db", "./memory.sqlite", "--origin", "claude"]
+      "args": ["-y", "--package=@zibby/agent-graph-memory", "agent-graph-mcp", "--db", "./memory.sqlite", "--origin", "claude"]
     }
   }
 }
@@ -108,7 +108,7 @@ The bin is `agent-graph-mcp`, shipped inside the `agent-graph` package, so `npx`
 ```toml
 [mcp_servers.memory]
 command = "npx"
-args = ["-y", "--package=agent-graph-memory", "agent-graph-mcp", "--db", "./memory.sqlite", "--origin", "codex"]
+args = ["-y", "--package=@zibby/agent-graph-memory", "agent-graph-mcp", "--db", "./memory.sqlite", "--origin", "codex"]
 ```
 
 Add `--read-only` to expose only the read tools, or `--trusted` when the server acts for a runtime that may record `provenance: "observed"` — by default an agent-driven session can only write `claimed`.
@@ -145,7 +145,7 @@ Both give the same answer; the graph one also carries the path walked, each hop'
 Some hosts (a serverless function, a container that is recycled, a sandbox) cannot keep the SQLite file. The graph therefore exposes its writes:
 
 ```js
-import { openGraph, journalToSql } from 'agent-graph-memory';
+import { openGraph, journalToSql } from '@zibby/agent-graph-memory';
 
 // 1. Journal: every successful write, after commit, in commit order.
 const g = await openGraph(':memory:', {
@@ -189,7 +189,7 @@ The schema DDL and every write statement have one definition (`schema.ts`); `ren
 Off by default. Turn it on by giving the graph a model:
 
 ```js
-import { openGraph, openAiCompatibleEmbedder } from 'agent-graph-memory';
+import { openGraph, openAiCompatibleEmbedder } from '@zibby/agent-graph-memory';
 
 const model = openAiCompatibleEmbedder({ baseUrl: 'http://localhost:11434', model: 'nomic-embed-text', dims: 768 }); // Ollama; OpenAI and vLLM speak the same shape
 
